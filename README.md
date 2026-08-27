@@ -11,9 +11,12 @@
 ```json
 {
   "command": "tasklist",
-  "cwd": "D:\\Desktop"
+  "cwd": "D:\\Desktop",
+  "timeout": 300000
 }
 ```
+
+`timeout` 单位为毫秒，可选，默认值为 `300000`（5 分钟）。超时后服务会终止命令进程树，并返回 `timed_out: true`。
 
 响应示例：
 
@@ -23,9 +26,30 @@
   "exit_code": 0,
   "stdout": "...",
   "stderr": "",
+  "timed_out": false,
   "error": null
 }
 ```
+
+### 流式执行命令
+
+`POST /exec/stream`
+
+请求负载与 `/exec` 相同。响应使用 HTTP chunked 传输，内容类型为 NDJSON；命令执行期间会持续返回事件：
+
+```json
+{"type":"stdout","data":"hello\r\n"}
+{"type":"stderr","data":"warning\r\n"}
+{"type":"exit","exit_code":0}
+```
+
+超时时最后一条事件为：
+
+```json
+{"type":"timeout","timeout":300000}
+```
+
+如果命令无法启动，则返回 `error` 事件。
 
 ### 下载文件
 `POST /download`
