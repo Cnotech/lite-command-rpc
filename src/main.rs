@@ -47,6 +47,19 @@ enum OutputMessage {
     Closed,
 }
 
+fn send_pipe_data(sender: &mpsc::Sender<OutputMessage>, stdout: bool, data: Vec<u8>) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+
+    let message = if stdout {
+        OutputMessage::Stdout(data)
+    } else {
+        OutputMessage::Stderr(data)
+    };
+    sender.send(message).is_ok()
+}
+
 struct RunResult {
     exit_code: Option<i32>,
     timed_out: bool,
@@ -140,18 +153,40 @@ where
 {
     thread::spawn(move || {
         let mut buffer = [0u8; 8192];
+        let mut pending = Vec::new();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(size) => {
-                    let data = buffer[..size].to_vec();
-                    let message = if stdout {
-                        OutputMessage::Stdout(data)
-                    } else {
-                        OutputMessage::Stderr(data)
-                    };
-                    if sender.send(message).is_err() {
-                        return;
+                    pending.extend_from_slice(&buffer[..size]);
+
+                    loop {
+                        match std::str::from_utf8(&pending) {
+                            Ok(_) => {
+                                if !send_pipe_data(&sender, stdout, std::mem::take(&mut pending)) {
+                                    return;
+                                }
+                                break;
+                            }
+                            Err(err) => {
+                                let valid_up_to = err.valid_up_to();
+                                if valid_up_to > 0 {
+                                    let valid = pending.drain(..valid_up_to).collect();
+                                    if !send_pipe_data(&sender, stdout, valid) {
+                                        return;
+                                    }
+                                }
+
+                                let Some(error_len) = err.error_len() else {
+                                    // UTF-8 字符可能刚好跨越两次 pipe read，留到下一批再解码。
+                                    break;
+                                };
+                                pending.drain(..error_len);
+                                if !send_pipe_data(&sender, stdout, "�".as_bytes().to_vec()) {
+                                    return;
+                                }
+                            }
+                        }
                     }
                 }
                 Err(err) => {
@@ -161,6 +196,16 @@ where
                     break;
                 }
             }
+        }
+
+        if !pending.is_empty()
+            && !send_pipe_data(
+                &sender,
+                stdout,
+                String::from_utf8_lossy(&pending).into_owned().into_bytes(),
+            )
+        {
+            return;
         }
         let _ = sender.send(OutputMessage::Closed);
     });
@@ -192,8 +237,9 @@ where
     F: FnMut(bool, &[u8]) -> std::io::Result<()>,
 {
     let mut command = Command::new("cmd.exe");
+    let command_line = format!("chcp 65001 >nul & {}", req.command);
     command
-        .args(["/d", "/s", "/c", &req.command])
+        .args(["/d", "/s", "/c", &command_line])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(cwd) = &req.cwd {
