@@ -61,3 +61,26 @@
     "path": "D:\\Desktop\\test.7z"
 }
 ```
+
+### 上传文件
+
+`POST /upload`
+
+请求体直接传输文件内容，并通过 `X-File-Path` 请求头指定目标路径。上传过程为流式写入，不会把整个文件加载到内存；目标文件已存在时返回 `409 Conflict`，不会覆盖。
+
+```powershell
+curl.exe http://127.0.0.1:9527/upload `
+  -H "Content-Type: application/octet-stream" `
+  -H "X-File-Path: D:\Desktop\uploaded.7z" `
+  --data-binary "@D:\Download\source.7z"
+```
+
+成功时返回：
+
+```json
+{
+  "ok": true,
+  "path": "D:\\Desktop\\uploaded.7z",
+  "bytes": 123456
+}
+```
