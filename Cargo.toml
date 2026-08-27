@@ -6,7 +6,6 @@ autobins = false
 
 [[bin]]
 name = "lite-command-rpc"
-path = "src/server.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

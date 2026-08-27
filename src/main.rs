@@ -142,10 +142,6 @@ fn main() -> std::io::Result<()> {
     let addr = "0.0.0.0:9527";
     let listener = TcpListener::bind(addr)?;
     println!("lite-command-rpc listening on http://{addr}");
-    println!("POST /exec");
-    println!("POST /exec/stream");
-    println!("POST /download");
-    println!("POST /upload");
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
