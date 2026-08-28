@@ -69,7 +69,8 @@ Content-Type: application/json
   "command": "tasklist",
   "cwd": "D:\\Desktop",
   "timeout": 300000,
-  "interpreter": "cmd"
+  "interpreter": "cmd",
+  "script_mode": "auto"
 }
 ```
 
@@ -81,6 +82,7 @@ Content-Type: application/json
 | `cwd` | 否 | 命令的工作目录 |
 | `timeout` | 否 | 超时时间，单位为毫秒，默认 300000（5 分钟） |
 | `interpreter` | 否 | 脚本解释器，默认为 `cmd`；可设为 `cmd`、`pwsh` 或解释器的 Windows 绝对路径 |
+| `script_mode` | 否 | 脚本执行方式，可设为 `auto`、`inline` 或 `file`，默认为 `auto` |
 
 解释器的调用方式如下：
 
@@ -98,6 +100,26 @@ Content-Type: application/json
 ```
 
 相对路径不受支持。绝对路径中包含空格时无需额外添加引号。
+
+#### 多行脚本
+
+`script_mode` 控制命令是直接传给解释器，还是先写入临时脚本文件：
+
+- `auto`：检测到 `command` 中包含换行符时使用临时文件，否则直接执行。
+- `inline`：始终直接传给解释器。
+- `file`：始终写入临时文件后执行。
+
+例如执行多行 CMD 脚本：
+
+```json
+{
+  "command": "@echo off\r\nset NAME=Lite Command RPC\r\necho %NAME%",
+  "interpreter": "cmd",
+  "script_mode": "auto"
+}
+```
+
+CMD 临时脚本使用 `.cmd` 扩展名并切换至 UTF-8 代码页，PowerShell 临时脚本使用带 UTF-8 BOM 的 `.ps1` 文件，其他解释器使用通用脚本文件。临时文件会在执行结束、超时或启动失败后自动删除。
 
 响应示例：
 

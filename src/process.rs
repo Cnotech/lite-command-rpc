@@ -1,14 +1,20 @@
 use serde::{Deserialize, de};
 use std::{
-    io::Read,
+    fs::{File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, RecvTimeoutError},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+static SCRIPT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub enum ScriptInterpreter {
@@ -38,17 +44,36 @@ impl<'de> Deserialize<'de> for ScriptInterpreter {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptMode {
+    #[default]
+    Auto,
+    Inline,
+    File,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ExecRequest {
     pub command: String,
     pub cwd: Option<String>,
     pub timeout: Option<u64>,
     pub interpreter: Option<ScriptInterpreter>,
+    #[serde(default)]
+    pub script_mode: ScriptMode,
 }
 
 impl ExecRequest {
     pub fn timeout_ms(&self) -> u64 {
         self.timeout.unwrap_or(DEFAULT_TIMEOUT_MS)
+    }
+
+    fn use_script_file(&self) -> bool {
+        match self.script_mode {
+            ScriptMode::Auto => self.command.contains(['\r', '\n']),
+            ScriptMode::Inline => false,
+            ScriptMode::File => true,
+        }
     }
 }
 
@@ -260,6 +285,62 @@ fn is_pwsh(path: &str) -> bool {
     )
 }
 
+fn script_extension(req: &ExecRequest) -> &'static str {
+    match req.interpreter.as_ref() {
+        None | Some(ScriptInterpreter::Cmd) => "cmd",
+        Some(ScriptInterpreter::Pwsh) => "ps1",
+        Some(ScriptInterpreter::Absolute(path)) if is_cmd(path) => "cmd",
+        Some(ScriptInterpreter::Absolute(path)) if is_pwsh(path) => "ps1",
+        Some(ScriptInterpreter::Absolute(_)) => "script",
+    }
+}
+
+struct TemporaryScript {
+    path: PathBuf,
+}
+
+impl TemporaryScript {
+    fn new(req: &ExecRequest) -> std::io::Result<Self> {
+        let extension = script_extension(req);
+        for _ in 0..100 {
+            let id = SCRIPT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "lcr-script-{}-{id}.{extension}",
+                std::process::id()
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    let temporary = Self { path };
+                    write_script(req, &mut file)?;
+                    file.flush()?;
+                    return Ok(temporary);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a temporary script file",
+        ))
+    }
+}
+
+impl Drop for TemporaryScript {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn write_script(req: &ExecRequest, file: &mut File) -> std::io::Result<()> {
+    match script_extension(req) {
+        "cmd" => file.write_all(b"@chcp 65001 >nul\r\n")?,
+        "ps1" => file.write_all(&[0xef, 0xbb, 0xbf])?,
+        _ => {}
+    }
+    file.write_all(req.command.as_bytes())
+}
+
 fn configure_cmd(program: &str, script: &str) -> Command {
     let mut command = Command::new(program);
     let command_line = format!("chcp 65001 >nul & {script}");
@@ -279,7 +360,7 @@ fn configure_pwsh(program: &str, script: &str) -> Command {
     command
 }
 
-fn build_command(req: &ExecRequest) -> Command {
+fn build_inline_command(req: &ExecRequest) -> Command {
     match req.interpreter.as_ref() {
         None | Some(ScriptInterpreter::Cmd) => configure_cmd("cmd.exe", &req.command),
         Some(ScriptInterpreter::Pwsh) => configure_pwsh("pwsh.exe", &req.command),
@@ -297,11 +378,52 @@ fn build_command(req: &ExecRequest) -> Command {
     }
 }
 
+fn configure_cmd_file(program: &str, path: &Path) -> Command {
+    let mut command = Command::new(program);
+    command.args(["/d", "/c"]).arg(path);
+    command
+}
+
+fn configure_pwsh_file(program: &str, path: &Path) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+        .arg(path);
+    command
+}
+
+fn build_file_command(req: &ExecRequest, path: &Path) -> Command {
+    match req.interpreter.as_ref() {
+        None | Some(ScriptInterpreter::Cmd) => configure_cmd_file("cmd.exe", path),
+        Some(ScriptInterpreter::Pwsh) => configure_pwsh_file("pwsh.exe", path),
+        Some(ScriptInterpreter::Absolute(program)) if is_cmd(program) => {
+            configure_cmd_file(program, path)
+        }
+        Some(ScriptInterpreter::Absolute(program)) if is_pwsh(program) => {
+            configure_pwsh_file(program, path)
+        }
+        Some(ScriptInterpreter::Absolute(program)) => {
+            let mut command = Command::new(program);
+            command.arg(path);
+            command
+        }
+    }
+}
+
+fn prepare_command(req: &ExecRequest) -> std::io::Result<(Command, Option<TemporaryScript>)> {
+    if !req.use_script_file() {
+        return Ok((build_inline_command(req), None));
+    }
+    let temporary = TemporaryScript::new(req)?;
+    let command = build_file_command(req, &temporary.path);
+    Ok((command, Some(temporary)))
+}
+
 pub fn run_command<F>(req: &ExecRequest, mut on_output: F) -> std::io::Result<RunResult>
 where
     F: FnMut(bool, &[u8]) -> std::io::Result<()>,
 {
-    let mut command = build_command(req);
+    let (mut command, _temporary_script) = prepare_command(req)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(cwd) = &req.cwd {
         command.current_dir(cwd);
@@ -389,7 +511,7 @@ mod tests {
 
     #[test]
     fn defaults_to_cmd() {
-        let command = build_command(&request(r#"{"command":"echo hello"}"#));
+        let command = build_inline_command(&request(r#"{"command":"echo hello"}"#));
         assert_eq!(command.get_program(), "cmd.exe");
         assert_eq!(
             args(&command),
@@ -399,7 +521,7 @@ mod tests {
 
     #[test]
     fn supports_pwsh() {
-        let command = build_command(&request(
+        let command = build_inline_command(&request(
             r#"{"command":"Get-Process","interpreter":"pwsh"}"#,
         ));
         assert_eq!(command.get_program(), "pwsh.exe");
@@ -417,7 +539,7 @@ mod tests {
 
     #[test]
     fn supports_absolute_interpreter_path() {
-        let command = build_command(&request(
+        let command = build_inline_command(&request(
             r#"{"command":"print('hello')","interpreter":"C:\\Python313\\python.exe"}"#,
         ));
         assert_eq!(command.get_program(), r"C:\Python313\python.exe");
@@ -426,7 +548,7 @@ mod tests {
 
     #[test]
     fn applies_known_arguments_to_absolute_pwsh_path() {
-        let command = build_command(&request(
+        let command = build_inline_command(&request(
             r#"{"command":"Get-Date","interpreter":"C:\\Program Files\\PowerShell\\7\\pwsh.exe"}"#,
         ));
         assert_eq!(
@@ -455,5 +577,44 @@ mod tests {
         assert!(is_windows_absolute_path(r"\\server\share\shell.exe"));
         assert!(!is_windows_absolute_path(r"C:shell.exe"));
         assert!(!is_windows_absolute_path(r"Tools\shell.exe"));
+    }
+
+    #[test]
+    fn auto_mode_uses_file_only_for_multiline_scripts() {
+        assert!(!request(r#"{"command":"echo hello"}"#).use_script_file());
+        assert!(request("{\"command\":\"echo one\\necho two\"}").use_script_file());
+        assert!(request("{\"command\":\"echo one\\recho two\"}").use_script_file());
+    }
+
+    #[test]
+    fn script_mode_can_force_inline_or_file_execution() {
+        assert!(request(r#"{"command":"echo hello","script_mode":"file"}"#).use_script_file());
+        assert!(
+            !request("{\"command\":\"echo one\\necho two\",\"script_mode\":\"inline\"}")
+                .use_script_file()
+        );
+    }
+
+    #[test]
+    fn temporary_cmd_script_is_created_and_removed() {
+        let req = request(r#"{"command":"echo hello","script_mode":"file"}"#);
+        let (command, temporary) = prepare_command(&req).expect("command should be prepared");
+        let temporary = temporary.expect("temporary script should exist");
+        let path = temporary.path.clone();
+
+        assert_eq!(command.get_program(), "cmd.exe");
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("cmd")
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("script should be readable"),
+            b"@chcp 65001 >nul\r\necho hello"
+        );
+        assert_eq!(args(&command)[..2], ["/d", "/c"]);
+        assert_eq!(args(&command)[2], path.to_string_lossy());
+
+        drop(temporary);
+        assert!(!path.exists());
     }
 }
