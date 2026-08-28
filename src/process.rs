@@ -237,10 +237,10 @@ where
 
 #[cfg(windows)]
 fn terminate_process_tree(child: &mut Child, job: Option<&ProcessJob>) {
-    if let Some(job) = job {
-        if job.terminate().is_ok() {
-            return;
-        }
+    if let Some(job) = job
+        && job.terminate().is_ok()
+    {
+        return;
     }
     let _ = Command::new("taskkill")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
