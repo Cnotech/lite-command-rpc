@@ -22,6 +22,23 @@ function Invoke-JsonPost {
         -Body ($Body | ConvertTo-Json -Compress)
 }
 
+function Get-ResponseText {
+    param($Response)
+
+    if ($Response.Content -is [byte[]]) {
+        return [System.Text.Encoding]::UTF8.GetString($Response.Content)
+    }
+    return [string]$Response.Content
+}
+
+function ConvertFrom-Ndjson {
+    param([string]$Text)
+
+    $Text -split "\r?\n" |
+        Where-Object { $_.Trim() } |
+        ForEach-Object { $_ | ConvertFrom-Json }
+}
+
 $binary = (Resolve-Path "target/release/lcr.exe").Path
 $listenHost = "127.0.0.1"
 $listenPort = 19527
@@ -127,16 +144,17 @@ try {
         -Uri "$($script:BaseUri)/exec/stream" `
         -ContentType "application/json" `
         -Body (@{ command = "echo stream-out & echo stream-err 1>&2" } | ConvertTo-Json -Compress)
-    $events = @(
-        $streamResponse.Content -split "`n" |
-            Where-Object { $_.Trim() } |
-            ForEach-Object { $_ | ConvertFrom-Json }
-    )
-    $streamStdout = (($events | Where-Object type -eq "stdout").data -join "")
-    $streamStderr = (($events | Where-Object type -eq "stderr").data -join "")
-    $exitEvent = $events | Where-Object type -eq "exit" | Select-Object -Last 1
-    Assert-True ($streamStdout.Contains("stream-out")) "streaming stdout should be returned"
-    Assert-True ($streamStderr.Contains("stream-err")) "streaming stderr should be returned"
+    $streamText = Get-ResponseText $streamResponse
+    $events = @(ConvertFrom-Ndjson $streamText)
+    $streamStdout = (($events | Where-Object { $_.type -eq "stdout" } | ForEach-Object { $_.data }) -join "")
+    $streamStderr = (($events | Where-Object { $_.type -eq "stderr" } | ForEach-Object { $_.data }) -join "")
+    $exitEvent = $events | Where-Object { $_.type -eq "exit" } | Select-Object -Last 1
+    Assert-True `
+        ($streamStdout.Contains("stream-out")) `
+        "streaming stdout should be returned; response: $streamText"
+    Assert-True `
+        ($streamStderr.Contains("stream-err")) `
+        "streaming stderr should be returned; response: $streamText"
     Assert-True ($exitEvent.exit_code -eq 0) "streaming exit event should be returned"
 
     $streamTimeoutResponse = Invoke-WebRequest `
@@ -144,12 +162,9 @@ try {
         -Uri "$($script:BaseUri)/exec/stream" `
         -ContentType "application/json" `
         -Body (@{ command = "ping 127.0.0.1 -n 6 >nul"; timeout = 100 } | ConvertTo-Json -Compress)
-    $timeoutEvents = @(
-        $streamTimeoutResponse.Content -split "`n" |
-            Where-Object { $_.Trim() } |
-            ForEach-Object { $_ | ConvertFrom-Json }
-    )
-    $streamTimeoutEvent = $timeoutEvents | Where-Object type -eq "timeout" | Select-Object -Last 1
+    $streamTimeoutText = Get-ResponseText $streamTimeoutResponse
+    $timeoutEvents = @(ConvertFrom-Ndjson $streamTimeoutText)
+    $streamTimeoutEvent = $timeoutEvents | Where-Object { $_.type -eq "timeout" } | Select-Object -Last 1
     Assert-True ($streamTimeoutEvent.timeout -eq 100) "streaming timeout event should be returned"
 
     $timeoutResult = Invoke-JsonPost "/exec" @{
