@@ -7,6 +7,8 @@ use serde_json::Value;
 use std::{
     net::TcpStream,
     sync::{Mutex, OnceLock},
+    thread,
+    time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::HWND,
@@ -30,10 +32,18 @@ use windows_sys::Win32::{
 static CONTROL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const MAX_ACTIONS: usize = 256;
 const MAX_TEXT_CODE_UNITS: usize = 4096;
+const DEFAULT_ACTION_DELAY_MS: u64 = 50;
+const MAX_ACTION_DELAY_MS: u64 = 5_000;
 
 #[derive(Debug, Deserialize)]
 struct ControlRequest {
     actions: Vec<Action>,
+    #[serde(default = "default_action_delay_ms", alias = "delay_ms")]
+    delay: u64,
+}
+
+fn default_action_delay_ms() -> u64 {
+    DEFAULT_ACTION_DELAY_MS
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -357,6 +367,14 @@ pub fn handle(stream: &mut TcpStream, body: &[u8]) {
         );
         return;
     }
+    if request.delay > MAX_ACTION_DELAY_MS {
+        send_json_error(
+            stream,
+            "400 Bad Request",
+            &format!("delay must not exceed {MAX_ACTION_DELAY_MS} ms"),
+        );
+        return;
+    }
 
     let lock = CONTROL_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -383,6 +401,9 @@ pub fn handle(stream: &mut TcpStream, body: &[u8]) {
             .to_string();
             let _ = send_response(stream, "409 Conflict", &body, "application/json");
             return;
+        }
+        if index + 1 < request.actions.len() && request.delay > 0 {
+            thread::sleep(Duration::from_millis(request.delay));
         }
     }
     let body = serde_json::json!({
@@ -414,5 +435,17 @@ mod tests {
             123
         );
         assert!(parse_hwnd(&serde_json::json!(0)).is_err());
+    }
+
+    #[test]
+    fn control_delay_defaults_to_fifty_milliseconds_and_is_configurable() {
+        let default: ControlRequest =
+            serde_json::from_str(r#"{"actions":[{"type":"keyboard","key":"G"}]}"#).unwrap();
+        assert_eq!(default.delay, DEFAULT_ACTION_DELAY_MS);
+
+        let configured: ControlRequest =
+            serde_json::from_str(r#"{"actions":[{"type":"keyboard","key":"G"}],"delay":125}"#)
+                .unwrap();
+        assert_eq!(configured.delay, 125);
     }
 }

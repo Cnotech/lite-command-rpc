@@ -37,6 +37,7 @@ use std::{
 ///   timeout       Timeout in milliseconds; default: 300000
 ///   interpreter   cmd, pwsh, or an absolute path; default: cmd
 ///   script_mode   auto, inline, or file; default: auto
+///   detached      Let child processes survive after the wrapper exits; default: false
 ///
 /// In auto mode, multiline commands are executed through temporary script files.
 /// Only expose this unauthenticated service on a trusted or protected network.
@@ -98,9 +99,9 @@ fn parse_request_head(data: &[u8]) -> Result<RequestHead, String> {
     }
     let content_length = values
         .get("content-length")
-        .ok_or("Content-Length is required")?
-        .parse::<usize>()
-        .map_err(|_| "invalid Content-Length")?;
+        .map(|value| value.parse::<usize>().map_err(|_| "invalid Content-Length"))
+        .transpose()?
+        .unwrap_or(0);
     Ok(RequestHead {
         method,
         path,
@@ -175,12 +176,7 @@ fn handle_client(mut stream: TcpStream) {
     let head = match parse_request_head(&buffer[..header_end]) {
         Ok(head) => head,
         Err(error) => {
-            let status = if error == "Content-Length is required" {
-                "411 Length Required"
-            } else {
-                "400 Bad Request"
-            };
-            send_json_error(&mut stream, status, &error);
+            send_json_error(&mut stream, "400 Bad Request", &error);
             return;
         }
     };
@@ -243,6 +239,13 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use clap::{CommandFactory, error::ErrorKind};
+
+    #[test]
+    fn missing_content_length_means_an_empty_request_body() {
+        let head = parse_request_head(b"POST /windows HTTP/1.1\r\nHost: localhost\r\n")
+            .expect("empty requests should not require Content-Length");
+        assert_eq!(head.content_length, 0);
+    }
 
     #[test]
     fn no_arguments_starts_server() {

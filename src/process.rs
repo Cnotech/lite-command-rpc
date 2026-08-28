@@ -62,6 +62,8 @@ pub struct ExecRequest {
     pub interpreter: Option<ScriptInterpreter>,
     #[serde(default)]
     pub script_mode: ScriptMode,
+    #[serde(default)]
+    pub detached: bool,
 }
 
 impl ExecRequest {
@@ -109,7 +111,7 @@ struct ProcessJob {
 
 #[cfg(windows)]
 impl ProcessJob {
-    fn assign(child: &Child) -> std::io::Result<Self> {
+    fn assign(child: &Child, kill_on_close: bool) -> std::io::Result<Self> {
         use std::{mem::zeroed, os::windows::io::AsRawHandle};
         use windows_sys::Win32::{
             Foundation::{CloseHandle, HANDLE},
@@ -125,18 +127,20 @@ impl ProcessJob {
             if handle.is_null() {
                 return Err(std::io::Error::last_os_error());
             }
-            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            if SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                &limits as *const _ as *const _,
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ) == 0
-            {
-                let error = std::io::Error::last_os_error();
-                CloseHandle(handle);
-                return Err(error);
+            if kill_on_close {
+                let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &limits as *const _ as *const _,
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) == 0
+                {
+                    let error = std::io::Error::last_os_error();
+                    CloseHandle(handle);
+                    return Err(error);
+                }
             }
             if AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0 {
                 let error = std::io::Error::last_os_error();
@@ -195,7 +199,7 @@ struct ProcessJob;
 
 #[cfg(not(windows))]
 impl ProcessJob {
-    fn assign(_child: &Child) -> std::io::Result<Self> {
+    fn assign(_child: &Child, _kill_on_close: bool) -> std::io::Result<Self> {
         Ok(Self)
     }
 }
@@ -484,13 +488,17 @@ where
     F: FnMut(bool, &[u8]) -> std::io::Result<()>,
 {
     let (mut command, _temporary_script) = prepare_command(req)?;
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if req.detached {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    } else {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
     if let Some(cwd) = &req.cwd {
         command.current_dir(cwd);
     }
 
     let mut child = command.spawn()?;
-    let job = match ProcessJob::assign(&child) {
+    let job = match ProcessJob::assign(&child, !req.detached) {
         Ok(job) => Some(job),
         Err(err) if require_job => {
             let message = format!(
@@ -511,11 +519,19 @@ where
         }
     };
     on_started(child.id());
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
     let (sender, receiver) = mpsc::channel();
-    spawn_pipe_reader(stdout, true, sender.clone());
-    spawn_pipe_reader(stderr, false, sender);
+    let mut closed_pipes = 0;
+    if let Some(stdout) = child.stdout.take() {
+        spawn_pipe_reader(stdout, true, sender.clone());
+    } else {
+        closed_pipes += 1;
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_pipe_reader(stderr, false, sender.clone());
+    } else {
+        closed_pipes += 1;
+    }
+    drop(sender);
 
     let timeout_ms = req.timeout_ms();
     let deadline = Instant::now()
@@ -524,7 +540,6 @@ where
     let mut timed_out = false;
     let mut terminated = false;
     let mut process_status = None;
-    let mut closed_pipes = 0;
     while process_status.is_none() || closed_pipes < 2 {
         if process_status.is_none() {
             process_status = child.try_wait()?;
@@ -683,6 +698,12 @@ mod tests {
             !request("{\"command\":\"echo one\\necho two\",\"script_mode\":\"inline\"}")
                 .use_script_file()
         );
+    }
+
+    #[test]
+    fn detached_is_opt_in() {
+        assert!(!request(r#"{"command":"echo hello"}"#).detached);
+        assert!(request(r#"{"command":"echo hello","detached":true}"#).detached);
     }
 
     #[test]

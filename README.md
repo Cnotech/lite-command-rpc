@@ -120,6 +120,7 @@ Content-Type: application/json
 | `timeout` | 否 | 超时时间，单位为毫秒，默认 300000（5 分钟） |
 | `interpreter` | 否 | 脚本解释器，默认为 `cmd`；可设为 `cmd`、`pwsh` 或解释器的 Windows 绝对路径 |
 | `script_mode` | 否 | 脚本执行方式，可设为 `auto`、`inline` 或 `file`，默认为 `auto` |
+| `detached` | 否 | 是否允许包装脚本正常退出后其子进程继续运行，默认为 `false` |
 
 解释器的调用方式如下：
 
@@ -157,6 +158,8 @@ Content-Type: application/json
 ```
 
 CMD 临时脚本使用 `.cmd` 扩展名并切换至 UTF-8 代码页，PowerShell 临时脚本使用带 UTF-8 BOM 的 `.ps1` 文件，其他解释器使用通用脚本文件。临时文件会在执行结束、超时或启动失败后自动删除。
+
+`detached: true` 适用于由 CMD 或 PowerShell 包装脚本启动 GUI 程序的场景。为了避免 GUI 子进程继承输出管道并阻止包装脚本会话结束，detached 模式会将 stdout/stderr 重定向到空设备，因此响应中的两个输出字段为空。包装脚本仍会被加入 Job Object，所以在包装脚本运行期间，超时和 `/spawn/terminate` 仍会终止其进程树；包装脚本正常结束、会话进入 `exited` 后，已经启动的子进程不会因为 Job Object 关闭而被结束，也不再由该会话跟踪或终止。默认值 `false` 保持输出捕获和严格的进程树清理行为。
 
 响应示例：
 
@@ -297,10 +300,11 @@ Invoke-WebRequest `
 
 ### 控制窗口和输入
 
-`POST /control` 在当前输入桌面按数组顺序执行操作。同一时间只执行一个控制请求，以避免不同请求的键鼠动作交错：
+`POST /control` 在当前输入桌面按数组顺序执行操作。同一时间只执行一个控制请求，以避免不同请求的键鼠动作交错。相邻动作之间默认等待 50 毫秒，减少聚焦后紧接着输入时被 Windows 丢弃的概率；可通过顶层 `delay` 字段配置毫秒数，设为 0 可关闭等待，最大为 5000：
 
 ```json
 {
+  "delay": 100,
   "actions": [
     { "type": "focus_window", "hwnd": "0xA12BC" },
     { "type": "keyboard", "key": "G" },
@@ -311,6 +315,8 @@ Invoke-WebRequest `
   ]
 }
 ```
+
+`delay_ms` 可作为 `delay` 的兼容别名。延迟只发生在两个动作之间，单个动作或最后一个动作后不会额外等待。
 
 支持的操作：
 

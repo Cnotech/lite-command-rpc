@@ -69,11 +69,12 @@ $serverStdout = Join-Path $testRoot "server.stdout.log"
 $serverStderr = Join-Path $testRoot "server.stderr.log"
 $server = $null
 $failed = $false
-$script:ExpectedCaseCount = 18
+$script:ExpectedCaseCount = 20
 $script:CaseCount = 0
 $script:PassedCaseCount = 0
 $script:CurrentCase = $null
 $script:CurrentCaseTimer = $null
+$detachedChildPid = $null
 $totalTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
 New-Item -ItemType Directory -Path $testRoot | Out-Null
@@ -124,6 +125,38 @@ try {
     Assert-True $ready "lcr should listen on $listenAddress"
     Complete-E2ECase
 
+    Start-E2ECase "Empty request without Content-Length"
+    foreach ($emptyPath in @("/windows", "/screenshot")) {
+        $rawClient = [System.Net.Sockets.TcpClient]::new($listenHost, $listenPort)
+        try {
+            $rawStream = $rawClient.GetStream()
+            $requestBytes = [System.Text.Encoding]::ASCII.GetBytes(
+                "POST $emptyPath HTTP/1.1`r`nHost: $listenAddress`r`nConnection: close`r`n`r`n"
+            )
+            $rawStream.Write($requestBytes, 0, $requestBytes.Length)
+            $responseBuffer = [System.IO.MemoryStream]::new()
+            $rawStream.CopyTo($responseBuffer)
+            $responseBytes = $responseBuffer.ToArray()
+        }
+        finally {
+            $rawClient.Dispose()
+        }
+        $headerEnd = -1
+        for ($index = 0; $index -le $responseBytes.Length - 4; $index++) {
+            if ($responseBytes[$index] -eq 13 -and $responseBytes[$index + 1] -eq 10 -and `
+                $responseBytes[$index + 2] -eq 13 -and $responseBytes[$index + 3] -eq 10) {
+                $headerEnd = $index
+                break
+            }
+        }
+        Assert-True ($headerEnd -ge 0) "$emptyPath response should contain a complete HTTP header"
+        $responseHeaders = [System.Text.Encoding]::ASCII.GetString($responseBytes, 0, $headerEnd)
+        Assert-True `
+            ($responseHeaders.StartsWith("HTTP/1.1 200 OK")) `
+            "$emptyPath should accept a request without Content-Length"
+    }
+    Complete-E2ECase
+
     Start-E2ECase "CMD execution"
     $cmdResult = Invoke-JsonPost "/exec" @{
         command = "echo cmd-ok"
@@ -172,7 +205,7 @@ try {
 
     Start-E2ECase "Asynchronous spawn termination"
     $terminateSpawn = Invoke-JsonPost "/spawn" @{
-        command = '$child = Start-Process ping.exe -ArgumentList @("127.0.0.1", "-n", "30") -PassThru; Write-Output "child-pid=$($child.Id)"; Wait-Process -Id $child.Id'
+        command = '$child = Start-Process ping.exe -ArgumentList @("127.0.0.1", "-n", "30") -WindowStyle Hidden -PassThru; Write-Output "child-pid=$($child.Id)"; Wait-Process -Id $child.Id'
         interpreter = "pwsh"
         timeout = 60000
     }
@@ -225,6 +258,56 @@ try {
     Assert-True ($terminatedQuery.status -eq "terminated") "result should preserve terminated status"
     Complete-E2ECase
 
+    Start-E2ECase "Detached child survives wrapper exit"
+    $detachedPort = 19528
+    $detachedBinary = Join-Path $testRoot "detached-child.exe"
+    Copy-Item -LiteralPath $binary -Destination $detachedBinary
+    $detachedSpawn = Invoke-JsonPost "/spawn" @{
+        command = 'start "" /b ' + $detachedBinary + ' serve --listen 127.0.0.1:' + $detachedPort
+        interpreter = "cmd"
+        script_mode = "file"
+        detached = $true
+        timeout = 5000
+    }
+    $detachedResult = $null
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+        $detachedResult = Invoke-JsonPost "/spawn/result" @{
+            session_id = $detachedSpawn.session_id
+        }
+        if ($detachedResult.status -notin @("starting", "running")) {
+            break
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    Assert-True ($detachedResult.status -eq "exited") "detached wrapper should exit normally"
+    Assert-True ($detachedResult.stdout -eq "") "detached execution should not capture stdout"
+    $detachedReady = $false
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+        $detachedClient = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $connectTask = $detachedClient.ConnectAsync($listenHost, $detachedPort)
+            if ($connectTask.Wait(100) -and $detachedClient.Connected) {
+                $detachedReady = $true
+                break
+            }
+        }
+        catch {
+            Start-Sleep -Milliseconds 50
+        }
+        finally {
+            $detachedClient.Dispose()
+        }
+    }
+    Assert-True $detachedReady "detached child service should survive wrapper exit"
+    $detachedChildPid = (Get-Process -Name "detached-child").Id
+    Assert-True `
+        ($null -ne (Get-Process -Id $detachedChildPid -ErrorAction SilentlyContinue)) `
+        "detached child should survive wrapper exit"
+    Stop-Process -Id $detachedChildPid -Force
+    Wait-Process -Id $detachedChildPid -ErrorAction SilentlyContinue
+    $detachedChildPid = $null
+    Complete-E2ECase
+
     Start-E2ECase "Primary-screen PNG screenshot"
     $screenshotFile = Join-Path $testRoot "screenshot.png"
     $screenshotStatus = 200
@@ -272,6 +355,17 @@ try {
         $controlStatus = [int]$_.Exception.Response.StatusCode
     }
     Assert-True ($controlStatus -eq 400) "control should reject an empty action list"
+    $controlDelayStatus = 0
+    try {
+        Invoke-JsonPost "/control" @{
+            actions = @(@{ type = "keyboard"; key = "G" })
+            delay = 5001
+        } | Out-Null
+    }
+    catch {
+        $controlDelayStatus = [int]$_.Exception.Response.StatusCode
+    }
+    Assert-True ($controlDelayStatus -eq 400) "control should reject an excessive delay"
     Complete-E2ECase
 
     Start-E2ECase "Working directory"
@@ -405,6 +499,7 @@ try {
     $sourceHash = (Get-FileHash -Algorithm SHA256 $sourceFile).Hash
     $downloadHash = (Get-FileHash -Algorithm SHA256 $downloadedFile).Hash
     Assert-True ($sourceHash -eq $downloadHash) "downloaded file should match uploaded content"
+
     Complete-E2ECase
 
     Start-E2ECase "Server log levels and execution lifecycle"
@@ -456,6 +551,10 @@ catch {
     throw
 }
 finally {
+    if ($null -ne $detachedChildPid) {
+        Stop-Process -Id $detachedChildPid -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $detachedChildPid -ErrorAction SilentlyContinue
+    }
     if ($null -ne $server -and -not $server.HasExited) {
         Stop-Process -Id $server.Id -Force
         Wait-Process -Id $server.Id -ErrorAction SilentlyContinue
