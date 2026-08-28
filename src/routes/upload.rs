@@ -42,12 +42,9 @@ impl TemporaryUpload {
     }
 
     fn commit(self, destination: &Path) -> std::io::Result<()> {
-        // hard_link 是 no-clobber 的：目标若已存在会失败，不会覆盖已有数据。
-        match fs::hard_link(&self.path, destination) {
-            Ok(()) => fs::remove_file(&self.path),
-            Err(err) if hard_link_is_unsupported(&err) => self.copy_without_overwrite(destination),
-            Err(err) => Err(err),
-        }
+        // 部分 WinPE RAM 文件系统会错误地报告 hard_link 成功，但删除临时文件时
+        // 目标也随之消失。始终使用 create_new + copy，保留 no-clobber 语义。
+        self.copy_without_overwrite(destination)
     }
 
     fn copy_without_overwrite(&self, destination: &Path) -> std::io::Result<()> {
@@ -64,10 +61,6 @@ impl TemporaryUpload {
         }
         Ok(())
     }
-}
-
-fn hard_link_is_unsupported(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::Unsupported || error.raw_os_error() == Some(1)
 }
 
 impl Drop for TemporaryUpload {
@@ -194,14 +187,37 @@ pub fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
-    fn recognizes_winpe_ram_drive_hard_link_error() {
-        assert!(hard_link_is_unsupported(
-            &std::io::Error::from_raw_os_error(1)
+    fn commit_copies_without_overwriting_an_existing_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "lcr-upload-test-{}-{}",
+            std::process::id(),
+            UPLOAD_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        assert!(!hard_link_is_unsupported(
-            &std::io::Error::from_raw_os_error(5)
-        ));
+        fs::create_dir(&root).expect("test directory should be created");
+        let destination = root.join("result.bin");
+
+        let (temporary, mut file) =
+            TemporaryUpload::new(&destination).expect("temporary upload should be created");
+        file.write_all(b"first").expect("upload should be written");
+        drop(file);
+        temporary
+            .commit(&destination)
+            .expect("upload should be committed");
+        assert_eq!(fs::read(&destination).unwrap(), b"first");
+
+        let (temporary, mut file) =
+            TemporaryUpload::new(&destination).expect("second upload should be created");
+        file.write_all(b"second").expect("upload should be written");
+        drop(file);
+        assert_eq!(
+            temporary.commit(&destination).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"first");
+
+        fs::remove_dir_all(root).expect("test directory should be removed");
     }
 }
