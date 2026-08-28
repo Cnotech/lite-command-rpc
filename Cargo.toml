@@ -5,7 +5,8 @@ edition = "2024"
 autobins = false
 
 [[bin]]
-name = "lite-command-rpc"
+name = "lcr"
+path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    name: Build and release Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Create ZIP package
+        shell: pwsh
+        run: |
+          $archive = "lcr-windows-x86_64.zip"
+          Compress-Archive -Path "target/release/lcr.exe" -DestinationPath $archive
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: lcr-windows-x86_64.zip
