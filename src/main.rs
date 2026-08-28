@@ -3,12 +3,47 @@ mod process;
 mod routes;
 
 use crate::http::{MAX_JSON_BODY_SIZE, read_body, send_json_error};
+use clap::{Parser, Subcommand};
 use std::{
     collections::HashMap,
     io::Read,
     net::{TcpListener, TcpStream},
+    process::ExitCode,
     thread,
 };
+
+/// Lightweight Windows HTTP service for command execution and file transfer.
+///
+/// Running without a command starts the server on http://0.0.0.0:9527.
+/// All endpoints use POST and the service has no authentication.
+///
+/// HTTP endpoints:
+///   /exec         Execute a command and return one JSON response
+///   /exec/stream  Execute a command and return NDJSON events
+///   /upload       Upload raw bytes using the X-File-Path header
+///   /download     Download the file named by the JSON `path` field
+///
+/// Execution JSON fields:
+///   command       Required script or command text
+///   cwd           Optional working directory
+///   timeout       Timeout in milliseconds; default: 300000
+///   interpreter   cmd, pwsh, or an absolute path; default: cmd
+///   script_mode   auto, inline, or file; default: auto
+///
+/// In auto mode, multiline commands are executed through temporary script files.
+/// Only expose this unauthenticated service on a trusted or protected network.
+#[derive(Debug, Parser)]
+#[command(name = "lcr", version, verbatim_doc_comment)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Debug, PartialEq, Subcommand)]
+enum CliCommand {
+    /// Start the HTTP service
+    Serve,
+}
 
 struct RequestHead {
     method: String,
@@ -138,10 +173,10 @@ fn handle_client(mut stream: TcpStream) {
     println!("client disconnected: {:?}", peer);
 }
 
-fn main() -> std::io::Result<()> {
+fn run_server() -> std::io::Result<()> {
     let addr = "0.0.0.0:9527";
     let listener = TcpListener::bind(addr)?;
-    println!("lite-command-rpc listening on http://{addr}");
+    println!("lcr listening on http://{addr}");
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -151,4 +186,67 @@ fn main() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match cli.command {
+        None | Some(CliCommand::Serve) => match run_server() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("failed to start lcr: {err}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, error::ErrorKind};
+
+    #[test]
+    fn no_arguments_starts_server() {
+        let cli = Cli::try_parse_from(["lcr"]).expect("arguments should be valid");
+        assert_eq!(cli.command, None);
+    }
+
+    #[test]
+    fn help_variants_show_help() {
+        for value in ["--help", "-h", "help"] {
+            let error = Cli::try_parse_from(["lcr", value]).expect_err("help should exit early");
+            assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        }
+    }
+
+    #[test]
+    fn serve_command_is_supported() {
+        let cli = Cli::try_parse_from(["lcr", "serve"]).expect("serve command should be valid");
+        assert_eq!(cli.command, Some(CliCommand::Serve));
+    }
+
+    #[test]
+    fn help_describes_the_http_api() {
+        let help = Cli::command().render_long_help().to_string();
+        for expected in [
+            "http://0.0.0.0:9527",
+            "/exec/stream",
+            "/upload",
+            "/download",
+            "interpreter",
+            "script_mode",
+            "no authentication",
+        ] {
+            assert!(help.contains(expected), "help should contain {expected}");
+        }
+    }
+
+    #[test]
+    fn unsupported_arguments_are_rejected() {
+        let unknown = Cli::try_parse_from(["lcr", "--unknown"]).expect_err("argument is unknown");
+        assert_eq!(unknown.kind(), ErrorKind::UnknownArgument);
+
+        assert!(Cli::try_parse_from(["lcr", "help", "extra"]).is_err());
+    }
 }

@@ -3,15 +3,16 @@
 Lite Command RPC 是一个面向 Windows 的轻量级 HTTP 命令执行服务，可为 Agent 或自动化工具提供远程执行命令、上传文件和下载文件的简单入口。
 
 > [!IMPORTANT]
-> 本项目仅适配 Windows 平台。命令通过 `cmd.exe` 执行，进程树终止等能力也依赖 Windows API。
+> 本项目专为 Windows PE 场景下的问题排查设计，仅适配 Windows 平台。
 
-## 功能
+## 特性
 
 - 普通或流式执行 Windows 命令
 - 支持设置工作目录和执行超时时间
 - 超时后终止整个命令进程树
 - 上传和下载文件
-- 使用 UTF-8 代码页执行命令，便于正确返回中文输出
+- 支持 `cmd`、PowerShell 7 和自定义解释器
+- 自动通过临时文件执行多行脚本
 - 单文件部署，无额外运行时依赖
 
 ## 获取与运行
@@ -28,6 +29,14 @@ Lite Command RPC 是一个面向 Windows 的轻量级 HTTP 命令执行服务，
 http://0.0.0.0:9527
 ```
 
+查看命令行帮助：
+
+```powershell
+.\lcr.exe --help
+```
+
+也可以使用 `.\lcr.exe serve` 显式启动服务；其行为与不带参数运行相同。
+
 > 服务目前不包含身份认证。请仅在可信网络中使用，或通过防火墙、反向代理等方式限制访问。
 
 ## 从源码构建
@@ -35,7 +44,7 @@ http://0.0.0.0:9527
 需要在 Windows 上安装稳定版 Rust 工具链：
 
 ```powershell
-cargo build --release --locked
+cargo build -r
 ```
 
 构建产物位于：
@@ -191,7 +200,3 @@ curl.exe http://127.0.0.1:9527/upload `
   "bytes": 123456
 }
 ```
-
-## 发布
-
-推送新的 Git 标签后，GitHub Actions 会自动编译 64 位 Windows 版本、生成 `lcr-windows-x86_64.zip` 并创建对应的 GitHub Release。
