@@ -12,8 +12,8 @@ use windows_sys::Win32::{
     Foundation::HWND,
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDCW,
-        CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, GetDeviceCaps,
-        RASTERCAPS, RC_BITBLT, ReleaseDC, SRCCOPY, SelectObject,
+        CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, GetDIBits,
+        GetDeviceCaps, RASTERCAPS, RC_BITBLT, ReleaseDC, SRCCOPY, SelectObject,
     },
     UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
 };
@@ -118,6 +118,9 @@ unsafe fn capture_with_dib_section(
         if BitBlt(memory_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY) == 0 {
             return Err(last_error("BitBlt failed"));
         }
+        if GdiFlush() == 0 {
+            return Err(last_error("GdiFlush failed"));
+        }
 
         let pixel_count = (width as usize)
             .checked_mul(height as usize)
@@ -165,6 +168,9 @@ unsafe fn capture_with_compatible_bitmap(
         }
         if BitBlt(memory_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY) == 0 {
             return Err(last_error("BitBlt failed"));
+        }
+        if GdiFlush() == 0 {
+            return Err(last_error("GdiFlush failed"));
         }
 
         let pixel_count = (width as usize)

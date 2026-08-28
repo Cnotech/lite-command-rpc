@@ -94,8 +94,20 @@ fn parse_request_head(data: &[u8]) -> Result<RequestHead, String> {
 
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
-            values.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            let name = name.trim().to_ascii_lowercase();
+            if matches!(name.as_str(), "content-length" | "transfer-encoding")
+                && values.contains_key(&name)
+            {
+                return Err(format!("duplicate {name} header"));
+            }
+            values.insert(name, value.trim().to_string());
         }
+    }
+    if values.contains_key("transfer-encoding") && values.contains_key("content-length") {
+        return Err("Transfer-Encoding and Content-Length must not be combined".to_string());
+    }
+    if values.contains_key("transfer-encoding") {
+        return Err("unsupported Transfer-Encoding".to_string());
     }
     let content_length = values
         .get("content-length")
@@ -245,6 +257,42 @@ mod tests {
         let head = parse_request_head(b"POST /windows HTTP/1.1\r\nHost: localhost\r\n")
             .expect("empty requests should not require Content-Length");
         assert_eq!(head.content_length, 0);
+    }
+
+    #[test]
+    fn unsupported_or_ambiguous_transfer_encoding_is_rejected() {
+        assert_eq!(
+            parse_request_head(
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity\r\n"
+            )
+            .err()
+            .expect("transfer encodings should be rejected"),
+            "unsupported Transfer-Encoding"
+        );
+        assert_eq!(
+            parse_request_head(
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity\r\nContent-Length: 4\r\n"
+            )
+            .err()
+            .expect("ambiguous request framing should be rejected"),
+            "Transfer-Encoding and Content-Length must not be combined"
+        );
+        assert_eq!(
+            parse_request_head(
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n"
+            )
+            .err()
+            .expect("duplicate transfer encoding should be rejected"),
+            "duplicate transfer-encoding header"
+        );
+        assert_eq!(
+            parse_request_head(
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nContent-Length: 4\r\n"
+            )
+            .err()
+            .expect("duplicate content length should be rejected"),
+            "duplicate content-length header"
+        );
     }
 
     #[test]

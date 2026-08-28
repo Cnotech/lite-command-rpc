@@ -34,6 +34,7 @@ const MAX_ACTIONS: usize = 256;
 const MAX_TEXT_CODE_UNITS: usize = 4096;
 const DEFAULT_ACTION_DELAY_MS: u64 = 50;
 const MAX_ACTION_DELAY_MS: u64 = 5_000;
+const MAX_TOTAL_ACTION_DELAY_MS: u64 = 30_000;
 
 #[derive(Debug, Deserialize)]
 struct ControlRequest {
@@ -44,6 +45,10 @@ struct ControlRequest {
 
 fn default_action_delay_ms() -> u64 {
     DEFAULT_ACTION_DELAY_MS
+}
+
+fn total_action_delay_ms(action_count: usize, delay: u64) -> u64 {
+    (action_count.saturating_sub(1) as u64).saturating_mul(delay)
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -375,6 +380,14 @@ pub fn handle(stream: &mut TcpStream, body: &[u8]) {
         );
         return;
     }
+    if total_action_delay_ms(request.actions.len(), request.delay) > MAX_TOTAL_ACTION_DELAY_MS {
+        send_json_error(
+            stream,
+            "400 Bad Request",
+            &format!("total action delay must not exceed {MAX_TOTAL_ACTION_DELAY_MS} ms"),
+        );
+        return;
+    }
 
     let lock = CONTROL_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -447,5 +460,8 @@ mod tests {
             serde_json::from_str(r#"{"actions":[{"type":"keyboard","key":"G"}],"delay":125}"#)
                 .unwrap();
         assert_eq!(configured.delay, 125);
+        assert_eq!(total_action_delay_ms(1, 5_000), 0);
+        assert_eq!(total_action_delay_ms(7, 5_000), 30_000);
+        assert_eq!(total_action_delay_ms(8, 5_000), 35_000);
     }
 }

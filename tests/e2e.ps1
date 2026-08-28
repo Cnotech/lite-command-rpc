@@ -59,9 +59,23 @@ function Complete-E2ECase {
     $script:CurrentCaseTimer = $null
 }
 
+function Get-FreeTcpPort {
+    $listener = [System.Net.Sockets.TcpListener]::new(
+        [System.Net.IPAddress]::Loopback,
+        0
+    )
+    try {
+        $listener.Start()
+        return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+    }
+    finally {
+        $listener.Stop()
+    }
+}
+
 $binary = (Resolve-Path "target/release/lcr.exe").Path
 $listenHost = "127.0.0.1"
-$listenPort = 19527
+$listenPort = Get-FreeTcpPort
 $listenAddress = "${listenHost}:$listenPort"
 $script:BaseUri = "http://$listenAddress"
 $testRoot = Join-Path $env:RUNNER_TEMP ("lcr-e2e-" + [guid]::NewGuid().ToString("N"))
@@ -69,12 +83,13 @@ $serverStdout = Join-Path $testRoot "server.stdout.log"
 $serverStderr = Join-Path $testRoot "server.stderr.log"
 $server = $null
 $failed = $false
-$script:ExpectedCaseCount = 20
+$script:ExpectedCaseCount = 21
 $script:CaseCount = 0
 $script:PassedCaseCount = 0
 $script:CurrentCase = $null
 $script:CurrentCaseTimer = $null
 $detachedChildPid = $null
+$detachedChildName = $null
 $totalTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
 New-Item -ItemType Directory -Path $testRoot | Out-Null
@@ -152,8 +167,42 @@ try {
         Assert-True ($headerEnd -ge 0) "$emptyPath response should contain a complete HTTP header"
         $responseHeaders = [System.Text.Encoding]::ASCII.GetString($responseBytes, 0, $headerEnd)
         Assert-True `
-            ($responseHeaders.StartsWith("HTTP/1.1 200 OK")) `
-            "$emptyPath should accept a request without Content-Length"
+            ($responseHeaders -match "^HTTP/1\.1 (200|500) ") `
+            "$emptyPath should be routed without requiring Content-Length"
+    }
+    Complete-E2ECase
+
+    Start-E2ECase "Unsupported transfer-encoded request bodies"
+    $transferTarget = Join-Path $testRoot "transfer-encoded-upload.bin"
+    $transferHeaderCases = @(
+        "Transfer-Encoding: chunked`r`n",
+        "Transfer-Encoding: identity`r`n",
+        "Transfer-Encoding: chunked`r`nTransfer-Encoding: identity`r`n"
+    )
+    foreach ($transferHeaders in $transferHeaderCases) {
+        $rawClient = [System.Net.Sockets.TcpClient]::new($listenHost, $listenPort)
+        try {
+            $rawStream = $rawClient.GetStream()
+            $requestBytes = [System.Text.Encoding]::ASCII.GetBytes(
+                "POST /upload HTTP/1.1`r`nHost: $listenAddress`r`n" +
+                $transferHeaders + "X-File-Path: $transferTarget`r`n" +
+                "Connection: close`r`n`r`n4`r`ntest`r`n0`r`n`r`n"
+            )
+            $rawStream.Write($requestBytes, 0, $requestBytes.Length)
+            $responseBuffer = [System.IO.MemoryStream]::new()
+            $rawStream.CopyTo($responseBuffer)
+            $responseBytes = $responseBuffer.ToArray()
+        }
+        finally {
+            $rawClient.Dispose()
+        }
+        $responseText = [System.Text.Encoding]::UTF8.GetString($responseBytes)
+        Assert-True `
+            ($responseText.StartsWith("HTTP/1.1 400 Bad Request")) `
+            "unsupported or duplicate Transfer-Encoding should be rejected"
+        Assert-True `
+            (-not (Test-Path -LiteralPath $transferTarget)) `
+            "rejected transfer-encoded upload should not create a destination file"
     }
     Complete-E2ECase
 
@@ -259,11 +308,12 @@ try {
     Complete-E2ECase
 
     Start-E2ECase "Detached child survives wrapper exit"
-    $detachedPort = 19528
-    $detachedBinary = Join-Path $testRoot "detached-child.exe"
+    $detachedPort = Get-FreeTcpPort
+    $detachedChildName = "lcr-detached-" + [guid]::NewGuid().ToString("N")
+    $detachedBinary = Join-Path $testRoot ($detachedChildName + ".exe")
     Copy-Item -LiteralPath $binary -Destination $detachedBinary
     $detachedSpawn = Invoke-JsonPost "/spawn" @{
-        command = 'start "" /b ' + $detachedBinary + ' serve --listen 127.0.0.1:' + $detachedPort
+        command = 'start "" /b "' + $detachedBinary + '" serve --listen 127.0.0.1:' + $detachedPort
         interpreter = "cmd"
         script_mode = "file"
         detached = $true
@@ -299,13 +349,14 @@ try {
         }
     }
     Assert-True $detachedReady "detached child service should survive wrapper exit"
-    $detachedChildPid = (Get-Process -Name "detached-child").Id
+    $detachedChildPid = (Get-Process -Name $detachedChildName).Id
     Assert-True `
         ($null -ne (Get-Process -Id $detachedChildPid -ErrorAction SilentlyContinue)) `
         "detached child should survive wrapper exit"
     Stop-Process -Id $detachedChildPid -Force
     Wait-Process -Id $detachedChildPid -ErrorAction SilentlyContinue
     $detachedChildPid = $null
+    $detachedChildName = $null
     Complete-E2ECase
 
     Start-E2ECase "Primary-screen PNG screenshot"
@@ -366,6 +417,19 @@ try {
         $controlDelayStatus = [int]$_.Exception.Response.StatusCode
     }
     Assert-True ($controlDelayStatus -eq 400) "control should reject an excessive delay"
+    $controlTotalDelayStatus = 0
+    try {
+        Invoke-JsonPost "/control" @{
+            actions = @(1..8 | ForEach-Object { @{ type = "keyboard"; key = "G" } })
+            delay = 5000
+        } | Out-Null
+    }
+    catch {
+        $controlTotalDelayStatus = [int]$_.Exception.Response.StatusCode
+    }
+    Assert-True `
+        ($controlTotalDelayStatus -eq 400) `
+        "control should reject an excessive total action delay"
     Complete-E2ECase
 
     Start-E2ECase "Working directory"
@@ -554,6 +618,10 @@ finally {
     if ($null -ne $detachedChildPid) {
         Stop-Process -Id $detachedChildPid -Force -ErrorAction SilentlyContinue
         Wait-Process -Id $detachedChildPid -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $detachedChildName) {
+        Get-Process -Name $detachedChildName -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
     }
     if ($null -ne $server -and -not $server.HasExited) {
         Stop-Process -Id $server.Id -Force

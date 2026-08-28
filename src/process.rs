@@ -266,8 +266,12 @@ where
 
 #[cfg(windows)]
 fn terminate_process_tree(child: &mut Child, job: Option<&ProcessJob>) -> std::io::Result<()> {
+    let mut job_error = None;
     if let Some(job) = job {
-        return job.terminate();
+        match job.terminate() {
+            Ok(()) => return Ok(()),
+            Err(err) => job_error = Some(err),
+        }
     }
     let taskkill = Command::new("taskkill")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
@@ -277,12 +281,14 @@ fn terminate_process_tree(child: &mut Child, job: Option<&ProcessJob>) -> std::i
     if taskkill.is_ok_and(|status| status.success()) {
         return Ok(());
     }
-    child.kill().or_else(|err| {
-        if err.kind() == std::io::ErrorKind::InvalidInput {
-            Ok(())
-        } else {
-            Err(err)
-        }
+    let child_result = child.kill();
+    if let Some(err) = job_error {
+        return Err(err);
+    }
+    child_result.or_else(|err| {
+        (err.kind() == std::io::ErrorKind::InvalidInput)
+            .then_some(())
+            .ok_or(err)
     })
 }
 
@@ -551,8 +557,8 @@ where
             let active_processes = job
                 .as_ref()
                 .expect("observed commands require a Job Object")
-                .active_processes()?;
-            if active_processes > 0 {
+                .active_processes();
+            if process_status.is_none() || !matches!(active_processes, Ok(0)) {
                 terminate_process_tree(&mut child, job.as_ref())?;
                 terminated = true;
             }
