@@ -43,9 +43,31 @@ impl TemporaryUpload {
 
     fn commit(self, destination: &Path) -> std::io::Result<()> {
         // hard_link 是 no-clobber 的：目标若已存在会失败，不会覆盖已有数据。
-        fs::hard_link(&self.path, destination)?;
-        fs::remove_file(&self.path)
+        match fs::hard_link(&self.path, destination) {
+            Ok(()) => fs::remove_file(&self.path),
+            Err(err) if hard_link_is_unsupported(&err) => self.copy_without_overwrite(destination),
+            Err(err) => Err(err),
+        }
     }
+
+    fn copy_without_overwrite(&self, destination: &Path) -> std::io::Result<()> {
+        let mut source = File::open(&self.path)?;
+        let mut target = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        let result = std::io::copy(&mut source, &mut target).and_then(|_| target.sync_all());
+        if let Err(err) = result {
+            drop(target);
+            let _ = fs::remove_file(destination);
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+fn hard_link_is_unsupported(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported || error.raw_os_error() == Some(1)
 }
 
 impl Drop for TemporaryUpload {
@@ -167,4 +189,19 @@ pub fn handle(
     })
     .to_string();
     let _ = send_response(stream, "201 Created", &body, "application/json");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_winpe_ram_drive_hard_link_error() {
+        assert!(hard_link_is_unsupported(
+            &std::io::Error::from_raw_os_error(1)
+        ));
+        assert!(!hard_link_is_unsupported(
+            &std::io::Error::from_raw_os_error(5)
+        ));
+    }
 }

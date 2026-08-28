@@ -1,6 +1,7 @@
 use crate::{
     http::{send_bytes_response, send_json_error},
     logger,
+    routes::desktop::InputDesktopGuard,
 };
 use std::{
     net::TcpStream,
@@ -10,8 +11,9 @@ use std::{
 use windows_sys::Win32::{
     Foundation::HWND,
     Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BitBlt, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC,
-        DeleteObject, GetDC, ReleaseDC, SRCCOPY, SelectObject,
+        BI_RGB, BITMAPINFO, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDCW,
+        CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, GetDeviceCaps,
+        RASTERCAPS, RC_BITBLT, ReleaseDC, SRCCOPY, SelectObject,
     },
     UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
 };
@@ -19,7 +21,6 @@ use windows_sys::Win32::{
 static SCREENSHOT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct CaptureResources {
-    screen_dc: windows_sys::Win32::Graphics::Gdi::HDC,
     memory_dc: windows_sys::Win32::Graphics::Gdi::HDC,
     bitmap: windows_sys::Win32::Graphics::Gdi::HBITMAP,
     old_object: windows_sys::Win32::Graphics::Gdi::HGDIOBJ,
@@ -36,9 +37,6 @@ impl Drop for CaptureResources {
             }
             if !self.memory_dc.is_null() {
                 DeleteDC(self.memory_dc);
-            }
-            if !self.screen_dc.is_null() {
-                ReleaseDC(std::ptr::null_mut(), self.screen_dc);
             }
         }
     }
@@ -72,23 +70,15 @@ fn bgra_to_opaque_rgba(bgra: &[u8]) -> Vec<u8> {
     rgba
 }
 
-fn capture_primary_screen_png() -> Result<Vec<u8>, String> {
-    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    if width <= 0 || height <= 0 {
-        return Err("screen dimensions are unavailable".to_string());
-    }
-
+unsafe fn capture_with_dib_section(
+    screen_dc: windows_sys::Win32::Graphics::Gdi::HDC,
+    width: i32,
+    height: i32,
+) -> Result<Vec<u8>, String> {
     unsafe {
-        let screen_dc = GetDC(std::ptr::null_mut::<core::ffi::c_void>() as HWND);
-        if screen_dc.is_null() {
-            return Err(last_error("GetDC failed"));
-        }
         let memory_dc = CreateCompatibleDC(screen_dc);
         if memory_dc.is_null() {
-            let error = last_error("CreateCompatibleDC failed");
-            ReleaseDC(std::ptr::null_mut(), screen_dc);
-            return Err(error);
+            return Err(last_error("CreateCompatibleDC failed"));
         }
 
         let mut bitmap_info: BITMAPINFO = std::mem::zeroed();
@@ -114,12 +104,10 @@ fn capture_primary_screen_png() -> Result<Vec<u8>, String> {
                 DeleteObject(bitmap);
             }
             DeleteDC(memory_dc);
-            ReleaseDC(std::ptr::null_mut(), screen_dc);
             return Err(error);
         }
         let old_object = SelectObject(memory_dc, bitmap);
         let resources = CaptureResources {
-            screen_dc,
             memory_dc,
             bitmap,
             old_object,
@@ -138,12 +126,154 @@ fn capture_primary_screen_png() -> Result<Vec<u8>, String> {
             .checked_mul(4)
             .ok_or("screen image is too large")?;
         let bgra = std::slice::from_raw_parts(pixels.cast::<u8>(), byte_count);
-        let rgba = bgra_to_opaque_rgba(bgra);
+        let captured = bgra.to_vec();
+        drop(resources);
+        Ok(captured)
+    }
+}
+
+unsafe fn capture_with_compatible_bitmap(
+    screen_dc: windows_sys::Win32::Graphics::Gdi::HDC,
+    width: i32,
+    height: i32,
+) -> Result<Vec<u8>, String> {
+    unsafe {
+        let raster_caps = GetDeviceCaps(screen_dc, RASTERCAPS as i32);
+        if raster_caps & RC_BITBLT as i32 == 0 {
+            return Err(format!(
+                "display device does not support BitBlt (RASTERCAPS=0x{raster_caps:X})"
+            ));
+        }
+        let memory_dc = CreateCompatibleDC(screen_dc);
+        if memory_dc.is_null() {
+            return Err(last_error("CreateCompatibleDC failed"));
+        }
+        let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
+        if bitmap.is_null() {
+            let error = last_error("CreateCompatibleBitmap failed");
+            DeleteDC(memory_dc);
+            return Err(error);
+        }
+        let old_object = SelectObject(memory_dc, bitmap);
+        let mut resources = CaptureResources {
+            memory_dc,
+            bitmap,
+            old_object,
+        };
+        if old_object.is_null() {
+            return Err(last_error("SelectObject failed"));
+        }
+        if BitBlt(memory_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY) == 0 {
+            return Err(last_error("BitBlt failed"));
+        }
+
+        let pixel_count = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or("screen dimensions are too large")?;
+        let byte_count = pixel_count
+            .checked_mul(4)
+            .ok_or("screen image is too large")?;
+        let mut bgra = vec![0; byte_count];
+        let mut bitmap_info: BITMAPINFO = std::mem::zeroed();
+        bitmap_info.bmiHeader.biSize = size_of_val(&bitmap_info.bmiHeader) as u32;
+        bitmap_info.bmiHeader.biWidth = width;
+        bitmap_info.bmiHeader.biHeight = -height;
+        bitmap_info.bmiHeader.biPlanes = 1;
+        bitmap_info.bmiHeader.biBitCount = 32;
+        bitmap_info.bmiHeader.biCompression = BI_RGB;
+
+        SelectObject(memory_dc, old_object);
+        resources.old_object = std::ptr::null_mut();
+        let scan_lines = GetDIBits(
+            memory_dc,
+            bitmap,
+            0,
+            height as u32,
+            bgra.as_mut_ptr().cast(),
+            &mut bitmap_info,
+            DIB_RGB_COLORS,
+        );
+        if scan_lines != height {
+            return Err(last_error("GetDIBits failed"));
+        }
+        drop(resources);
+        Ok(bgra)
+    }
+}
+
+fn capture_current_desktop_png() -> Result<Vec<u8>, String> {
+    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    if width <= 0 || height <= 0 {
+        return Err("screen dimensions are unavailable".to_string());
+    }
+
+    unsafe {
+        let screen_dc = GetDC(std::ptr::null_mut::<core::ffi::c_void>() as HWND);
+        let primary_result = if screen_dc.is_null() {
+            Err(last_error("GetDC failed"))
+        } else {
+            let result = capture_with_dib_section(screen_dc, width, height);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            result
+        };
+        let bgra = match primary_result {
+            Ok(bgra) => bgra,
+            Err(primary_error) => {
+                const DISPLAY: [u16; 8] = [
+                    b'D' as u16,
+                    b'I' as u16,
+                    b'S' as u16,
+                    b'P' as u16,
+                    b'L' as u16,
+                    b'A' as u16,
+                    b'Y' as u16,
+                    0,
+                ];
+                let display_dc = CreateDCW(
+                    DISPLAY.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if display_dc.is_null() {
+                    return Err(format!(
+                        "primary capture failed ({primary_error}); DISPLAY CreateDCW failed ({})",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                let fallback_result = capture_with_compatible_bitmap(display_dc, width, height);
+                DeleteDC(display_dc);
+                fallback_result.map_err(|fallback_error| {
+                    format!(
+                        "primary capture failed ({primary_error}); DISPLAY fallback failed ({fallback_error})"
+                    )
+                })?
+            }
+        };
+        let rgba = bgra_to_opaque_rgba(&bgra);
 
         let png_data = encode_rgba_png(width as u32, height as u32, &rgba)?;
-        drop(resources);
         Ok(png_data)
     }
+}
+
+fn capture_primary_screen_png() -> Result<Vec<u8>, String> {
+    let current_error = match capture_current_desktop_png() {
+        Ok(png) => return Ok(png),
+        Err(err) => err,
+    };
+
+    let _desktop_guard = InputDesktopGuard::enter().map_err(|desktop_error| {
+        format!(
+            "current desktop capture failed ({current_error}); input desktop unavailable ({desktop_error})"
+        )
+    })?;
+    capture_current_desktop_png().map_err(|input_error| {
+        format!(
+            "current desktop capture failed ({current_error}); input desktop capture failed ({input_error})"
+        )
+    })
 }
 
 pub fn handle(stream: &mut TcpStream) {

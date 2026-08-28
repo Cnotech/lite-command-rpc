@@ -1,4 +1,7 @@
-use crate::http::{send_json_error, send_response};
+use crate::{
+    http::{send_json_error, send_response},
+    routes::desktop::InputDesktopGuard,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -357,6 +360,17 @@ pub fn handle(stream: &mut TcpStream, body: &[u8]) {
 
     let lock = CONTROL_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _desktop_guard = match InputDesktopGuard::enter() {
+        Ok(guard) => guard,
+        Err(err) => {
+            send_json_error(
+                stream,
+                "500 Internal Server Error",
+                &format!("failed to enter input desktop: {err}"),
+            );
+            return;
+        }
+    };
     for (index, action) in request.actions.iter().enumerate() {
         if let Err(error) = execute_action(action) {
             let body = serde_json::json!({

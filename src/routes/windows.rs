@@ -1,4 +1,7 @@
-use crate::http::{send_json_error, send_response};
+use crate::{
+    http::{send_json_error, send_response},
+    routes::desktop::InputDesktopGuard,
+};
 use serde::Serialize;
 use std::net::TcpStream;
 use windows_sys::Win32::{
@@ -95,6 +98,17 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
 }
 
 pub fn handle(stream: &mut TcpStream) {
+    let _desktop_guard = match InputDesktopGuard::enter() {
+        Ok(guard) => guard,
+        Err(err) => {
+            send_json_error(
+                stream,
+                "500 Internal Server Error",
+                &format!("failed to enter input desktop: {err}"),
+            );
+            return;
+        }
+    };
     let foreground_hwnd = unsafe { GetForegroundWindow() };
     let mut context = EnumContext {
         windows: Vec::new(),
