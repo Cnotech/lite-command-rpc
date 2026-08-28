@@ -68,7 +68,8 @@ Content-Type: application/json
 {
   "command": "tasklist",
   "cwd": "D:\\Desktop",
-  "timeout": 300000
+  "timeout": 300000,
+  "interpreter": "cmd"
 }
 ```
 
@@ -76,9 +77,27 @@ Content-Type: application/json
 
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
-| `command` | 是 | 交给 `cmd.exe` 执行的命令 |
+| `command` | 是 | 交给所选解释器执行的脚本或命令 |
 | `cwd` | 否 | 命令的工作目录 |
 | `timeout` | 否 | 超时时间，单位为毫秒，默认 300000（5 分钟） |
+| `interpreter` | 否 | 脚本解释器，默认为 `cmd`；可设为 `cmd`、`pwsh` 或解释器的 Windows 绝对路径 |
+
+解释器的调用方式如下：
+
+- `cmd`：通过 `cmd.exe /d /s /c` 执行，并将代码页切换为 UTF-8。
+- `pwsh`：通过 `pwsh.exe -NoLogo -NoProfile -NonInteractive -Command` 执行，需要系统已安装 PowerShell 7。
+- 绝对路径：若文件名为 `cmd.exe`、`pwsh.exe` 或 `powershell.exe`，使用对应参数；其他解释器通过 `<绝对路径> -c <command>` 执行。
+
+例如使用指定位置的 Python：
+
+```json
+{
+  "command": "print('hello')",
+  "interpreter": "C:\\Python313\\python.exe"
+}
+```
+
+相对路径不受支持。绝对路径中包含空格时无需额外添加引号。
 
 响应示例：
 

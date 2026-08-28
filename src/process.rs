@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, de};
 use std::{
     io::Read,
     process::{Child, Command, Stdio},
@@ -10,11 +10,40 @@ use std::{
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+#[derive(Debug)]
+pub enum ScriptInterpreter {
+    Cmd,
+    Pwsh,
+    Absolute(String),
+}
+
+impl<'de> Deserialize<'de> for ScriptInterpreter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.eq_ignore_ascii_case("cmd") {
+            return Ok(Self::Cmd);
+        }
+        if value.eq_ignore_ascii_case("pwsh") {
+            return Ok(Self::Pwsh);
+        }
+        if is_windows_absolute_path(&value) {
+            return Ok(Self::Absolute(value));
+        }
+        Err(de::Error::custom(
+            "interpreter must be `cmd`, `pwsh`, or an absolute Windows path",
+        ))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ExecRequest {
     pub command: String,
     pub cwd: Option<String>,
     pub timeout: Option<u64>,
+    pub interpreter: Option<ScriptInterpreter>,
 }
 
 impl ExecRequest {
@@ -118,9 +147,6 @@ impl ProcessJob {
     fn assign(_child: &Child) -> std::io::Result<Self> {
         Ok(Self)
     }
-    fn terminate(&self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 fn spawn_pipe_reader<R>(mut reader: R, stdout: bool, sender: mpsc::Sender<OutputMessage>)
@@ -203,16 +229,80 @@ fn terminate_process_tree(child: &mut Child, _job: Option<&ProcessJob>) {
     let _ = child.kill();
 }
 
+fn is_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let unc_absolute = bytes.len() >= 3
+        && matches!(bytes[0], b'\\' | b'/')
+        && bytes[1] == bytes[0]
+        && !matches!(bytes[2], b'\\' | b'/');
+    drive_absolute || unc_absolute
+}
+
+fn interpreter_name(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+fn is_cmd(path: &str) -> bool {
+    matches!(
+        interpreter_name(path).to_ascii_lowercase().as_str(),
+        "cmd" | "cmd.exe"
+    )
+}
+
+fn is_pwsh(path: &str) -> bool {
+    matches!(
+        interpreter_name(path).to_ascii_lowercase().as_str(),
+        "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe"
+    )
+}
+
+fn configure_cmd(program: &str, script: &str) -> Command {
+    let mut command = Command::new(program);
+    let command_line = format!("chcp 65001 >nul & {script}");
+    command.args(["/d", "/s", "/c", &command_line]);
+    command
+}
+
+fn configure_pwsh(program: &str, script: &str) -> Command {
+    let mut command = Command::new(program);
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        script,
+    ]);
+    command
+}
+
+fn build_command(req: &ExecRequest) -> Command {
+    match req.interpreter.as_ref() {
+        None | Some(ScriptInterpreter::Cmd) => configure_cmd("cmd.exe", &req.command),
+        Some(ScriptInterpreter::Pwsh) => configure_pwsh("pwsh.exe", &req.command),
+        Some(ScriptInterpreter::Absolute(path)) if is_cmd(path) => {
+            configure_cmd(path, &req.command)
+        }
+        Some(ScriptInterpreter::Absolute(path)) if is_pwsh(path) => {
+            configure_pwsh(path, &req.command)
+        }
+        Some(ScriptInterpreter::Absolute(path)) => {
+            let mut command = Command::new(path);
+            command.args(["-c", &req.command]);
+            command
+        }
+    }
+}
+
 pub fn run_command<F>(req: &ExecRequest, mut on_output: F) -> std::io::Result<RunResult>
 where
     F: FnMut(bool, &[u8]) -> std::io::Result<()>,
 {
-    let mut command = Command::new("cmd.exe");
-    let command_line = format!("chcp 65001 >nul & {}", req.command);
-    command
-        .args(["/d", "/s", "/c", &command_line])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = build_command(req);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(cwd) = &req.cwd {
         command.current_dir(cwd);
     }
@@ -280,4 +370,90 @@ where
         exit_code: if timed_out { None } else { status.code() },
         timed_out,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(json: &str) -> ExecRequest {
+        serde_json::from_str(json).expect("request should be valid")
+    }
+
+    fn args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn defaults_to_cmd() {
+        let command = build_command(&request(r#"{"command":"echo hello"}"#));
+        assert_eq!(command.get_program(), "cmd.exe");
+        assert_eq!(
+            args(&command),
+            ["/d", "/s", "/c", "chcp 65001 >nul & echo hello"]
+        );
+    }
+
+    #[test]
+    fn supports_pwsh() {
+        let command = build_command(&request(
+            r#"{"command":"Get-Process","interpreter":"pwsh"}"#,
+        ));
+        assert_eq!(command.get_program(), "pwsh.exe");
+        assert_eq!(
+            args(&command),
+            [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-Process"
+            ]
+        );
+    }
+
+    #[test]
+    fn supports_absolute_interpreter_path() {
+        let command = build_command(&request(
+            r#"{"command":"print('hello')","interpreter":"C:\\Python313\\python.exe"}"#,
+        ));
+        assert_eq!(command.get_program(), r"C:\Python313\python.exe");
+        assert_eq!(args(&command), ["-c", "print('hello')"]);
+    }
+
+    #[test]
+    fn applies_known_arguments_to_absolute_pwsh_path() {
+        let command = build_command(&request(
+            r#"{"command":"Get-Date","interpreter":"C:\\Program Files\\PowerShell\\7\\pwsh.exe"}"#,
+        ));
+        assert_eq!(
+            args(&command),
+            [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-Date"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_relative_interpreter_path() {
+        let result = serde_json::from_str::<ExecRequest>(
+            r#"{"command":"echo hello","interpreter":"tools\\shell.exe"}"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn recognizes_windows_absolute_paths() {
+        assert!(is_windows_absolute_path(r"C:\Tools\shell.exe"));
+        assert!(is_windows_absolute_path(r"\\server\share\shell.exe"));
+        assert!(!is_windows_absolute_path(r"C:shell.exe"));
+        assert!(!is_windows_absolute_path(r"Tools\shell.exe"));
+    }
 }
