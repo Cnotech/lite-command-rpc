@@ -13,6 +13,7 @@ Lite Command RPC 是一个面向 Windows 的轻量级 HTTP 命令执行服务，
 - 上传和下载文件
 - 支持 `cmd`、PowerShell 7 和自定义解释器
 - 自动通过临时文件执行多行脚本
+- 支持配置监听 IP 和端口
 - 单文件部署，无额外运行时依赖
 
 ## 获取与运行
@@ -28,6 +29,15 @@ Lite Command RPC 是一个面向 Windows 的轻量级 HTTP 命令执行服务，
 ```text
 http://0.0.0.0:9527
 ```
+
+通过 `--listen` 修改监听地址，例如仅允许本机访问：
+
+```powershell
+.\lcr.exe --listen 127.0.0.1:9527
+.\lcr.exe serve --listen 127.0.0.1:9527
+```
+
+监听地址必须使用 `IP:端口` 格式；IPv6 地址需要写成 `[::1]:9527`。
 
 查看命令行帮助：
 

@@ -17,12 +17,16 @@ function Invoke-JsonPost {
     )
     Invoke-RestMethod `
         -Method Post `
-        -Uri "http://127.0.0.1:9527$Path" `
+        -Uri "$($script:BaseUri)$Path" `
         -ContentType "application/json" `
         -Body ($Body | ConvertTo-Json -Compress)
 }
 
 $binary = (Resolve-Path "target/release/lcr.exe").Path
+$listenHost = "127.0.0.1"
+$listenPort = 19527
+$listenAddress = "${listenHost}:$listenPort"
+$script:BaseUri = "http://$listenAddress"
 $testRoot = Join-Path $env:RUNNER_TEMP ("lcr-e2e-" + [guid]::NewGuid().ToString("N"))
 $serverStdout = Join-Path $testRoot "server.stdout.log"
 $serverStderr = Join-Path $testRoot "server.stderr.log"
@@ -45,6 +49,7 @@ try {
 
     $server = Start-Process `
         -FilePath $binary `
+        -ArgumentList @("serve", "--listen", $listenAddress) `
         -PassThru `
         -RedirectStandardOutput $serverStdout `
         -RedirectStandardError $serverStderr
@@ -56,7 +61,7 @@ try {
         }
         $client = [System.Net.Sockets.TcpClient]::new()
         try {
-            $client.Connect("127.0.0.1", 9527)
+            $client.Connect($listenHost, $listenPort)
             $ready = $true
             break
         }
@@ -119,7 +124,7 @@ try {
 
     $streamResponse = Invoke-WebRequest `
         -Method Post `
-        -Uri "http://127.0.0.1:9527/exec/stream" `
+        -Uri "$($script:BaseUri)/exec/stream" `
         -ContentType "application/json" `
         -Body (@{ command = "echo stream-out & echo stream-err 1>&2" } | ConvertTo-Json -Compress)
     $events = @(
@@ -136,7 +141,7 @@ try {
 
     $streamTimeoutResponse = Invoke-WebRequest `
         -Method Post `
-        -Uri "http://127.0.0.1:9527/exec/stream" `
+        -Uri "$($script:BaseUri)/exec/stream" `
         -ContentType "application/json" `
         -Body (@{ command = "ping 127.0.0.1 -n 6 >nul"; timeout = 100 } | ConvertTo-Json -Compress)
     $timeoutEvents = @(
@@ -161,7 +166,7 @@ try {
 
     $uploadResult = Invoke-RestMethod `
         -Method Post `
-        -Uri "http://127.0.0.1:9527/upload" `
+        -Uri "$($script:BaseUri)/upload" `
         -ContentType "application/octet-stream" `
         -Headers @{ "X-File-Path" = $uploadedFile } `
         -InFile $sourceFile
@@ -172,7 +177,7 @@ try {
     try {
         Invoke-RestMethod `
             -Method Post `
-            -Uri "http://127.0.0.1:9527/upload" `
+            -Uri "$($script:BaseUri)/upload" `
             -ContentType "application/octet-stream" `
             -Headers @{ "X-File-Path" = $uploadedFile } `
             -InFile $sourceFile | Out-Null
@@ -184,7 +189,7 @@ try {
 
     Invoke-WebRequest `
         -Method Post `
-        -Uri "http://127.0.0.1:9527/download" `
+        -Uri "$($script:BaseUri)/download" `
         -ContentType "application/json" `
         -Body (@{ path = $uploadedFile } | ConvertTo-Json -Compress) `
         -OutFile $downloadedFile

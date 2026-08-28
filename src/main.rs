@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use std::{
     collections::HashMap,
     io::Read,
-    net::{TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     process::ExitCode,
     thread,
 };
@@ -35,6 +35,15 @@ use std::{
 #[derive(Debug, Parser)]
 #[command(name = "lcr", version, verbatim_doc_comment)]
 struct Cli {
+    /// Address and port on which the HTTP service listens
+    #[arg(
+        long,
+        global = true,
+        value_name = "IP:PORT",
+        default_value = "0.0.0.0:9527"
+    )]
+    listen: SocketAddr,
+
     #[command(subcommand)]
     command: Option<CliCommand>,
 }
@@ -173,8 +182,7 @@ fn handle_client(mut stream: TcpStream) {
     println!("client disconnected: {:?}", peer);
 }
 
-fn run_server() -> std::io::Result<()> {
-    let addr = "0.0.0.0:9527";
+fn run_server(addr: SocketAddr) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     println!("lcr listening on http://{addr}");
     for stream in listener.incoming() {
@@ -191,7 +199,7 @@ fn run_server() -> std::io::Result<()> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        None | Some(CliCommand::Serve) => match run_server() {
+        None | Some(CliCommand::Serve) => match run_server(cli.listen) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("failed to start lcr: {err}");
@@ -210,6 +218,7 @@ mod tests {
     fn no_arguments_starts_server() {
         let cli = Cli::try_parse_from(["lcr"]).expect("arguments should be valid");
         assert_eq!(cli.command, None);
+        assert_eq!(cli.listen, "0.0.0.0:9527".parse().unwrap());
     }
 
     #[test]
@@ -224,6 +233,22 @@ mod tests {
     fn serve_command_is_supported() {
         let cli = Cli::try_parse_from(["lcr", "serve"]).expect("serve command should be valid");
         assert_eq!(cli.command, Some(CliCommand::Serve));
+    }
+
+    #[test]
+    fn listen_address_is_configurable_globally() {
+        for arguments in [
+            vec!["lcr", "--listen", "127.0.0.1:8080"],
+            vec!["lcr", "serve", "--listen", "127.0.0.1:8080"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("listen address should be valid");
+            assert_eq!(cli.listen, "127.0.0.1:8080".parse().unwrap());
+        }
+    }
+
+    #[test]
+    fn invalid_listen_address_is_rejected() {
+        assert!(Cli::try_parse_from(["lcr", "--listen", "localhost"]).is_err());
     }
 
     #[test]
