@@ -24,6 +24,25 @@ pub fn send_response(
     stream.flush()
 }
 
+pub fn send_bytes_response(
+    stream: &mut TcpStream,
+    status: &str,
+    body: &[u8],
+    content_type: &str,
+) -> std::io::Result<()> {
+    let headers = format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
 pub fn send_json_error(stream: &mut TcpStream, status: &str, error: &str) {
     let body = serde_json::json!({ "error": error }).to_string();
     let _ = send_response(stream, status, &body, "application/json");

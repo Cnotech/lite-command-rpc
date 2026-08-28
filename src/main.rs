@@ -22,6 +22,11 @@ use std::{
 /// HTTP endpoints:
 ///   /exec         Execute a command and return one JSON response
 ///   /exec/stream  Execute a command and return NDJSON events
+///   /spawn        Start a command asynchronously and return its session ID and PID
+///   /spawn/result Query an asynchronous command and its captured output
+///   /screenshot   Capture the primary screen as PNG
+///   /windows      List top-level windows on the current desktop
+///   /control      Focus a window or simulate keyboard and mouse input
 ///   /upload       Upload raw bytes using the X-File-Path header
 ///   /download     Download the file named by the JSON `path` field
 ///
@@ -123,6 +128,14 @@ fn handle_json_route(stream: &mut TcpStream, path: &str, prefetched: &[u8], cont
     match path {
         "/exec" => routes::exec::handle(stream, &body),
         "/exec/stream" => routes::exec::handle_stream(stream, &body),
+        "/spawn" => routes::spawn::handle_spawn(stream, &body),
+        "/spawn/result" => routes::spawn::handle_result(stream, &body),
+        #[cfg(windows)]
+        "/screenshot" => routes::screenshot::handle(stream),
+        #[cfg(windows)]
+        "/windows" => routes::windows::handle(stream),
+        #[cfg(windows)]
+        "/control" => routes::control::handle(stream, &body),
         "/download" => routes::download::handle(stream, &body),
         _ => send_json_error(stream, "404 Not Found", "not found"),
     }
@@ -284,6 +297,10 @@ mod tests {
         for expected in [
             "http://0.0.0.0:9527",
             "/exec/stream",
+            "/spawn/result",
+            "/screenshot",
+            "/windows",
+            "/control",
             "/upload",
             "/download",
             "interpreter",

@@ -420,8 +420,33 @@ fn prepare_command(req: &ExecRequest) -> std::io::Result<(Command, Option<Tempor
     Ok((command, Some(temporary)))
 }
 
-pub fn run_command<F>(req: &ExecRequest, mut on_output: F) -> std::io::Result<RunResult>
+pub fn run_command<F>(req: &ExecRequest, on_output: F) -> std::io::Result<RunResult>
 where
+    F: FnMut(bool, &[u8]) -> std::io::Result<()>,
+{
+    run_command_inner(req, false, |_| {}, on_output)
+}
+
+pub fn run_command_observed<S, F>(
+    req: &ExecRequest,
+    on_started: S,
+    on_output: F,
+) -> std::io::Result<RunResult>
+where
+    S: FnOnce(u32),
+    F: FnMut(bool, &[u8]) -> std::io::Result<()>,
+{
+    run_command_inner(req, true, on_started, on_output)
+}
+
+fn run_command_inner<S, F>(
+    req: &ExecRequest,
+    require_job: bool,
+    on_started: S,
+    mut on_output: F,
+) -> std::io::Result<RunResult>
+where
+    S: FnOnce(u32),
     F: FnMut(bool, &[u8]) -> std::io::Result<()>,
 {
     let (mut command, _temporary_script) = prepare_command(req)?;
@@ -433,6 +458,16 @@ where
     let mut child = command.spawn()?;
     let job = match ProcessJob::assign(&child) {
         Ok(job) => Some(job),
+        Err(err) if require_job => {
+            let message = format!(
+                "failed to assign process {} to Job Object: {err}",
+                child.id()
+            );
+            logger::error(format_args!("{message}"));
+            terminate_process_tree(&mut child, None);
+            let _ = child.wait();
+            return Err(std::io::Error::new(err.kind(), message));
+        }
         Err(err) => {
             logger::error(format_args!(
                 "failed to assign process {} to Job Object: {err}",
@@ -441,6 +476,7 @@ where
             None
         }
     };
+    on_started(child.id());
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let (sender, receiver) = mpsc::channel();

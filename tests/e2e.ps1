@@ -69,7 +69,7 @@ $serverStdout = Join-Path $testRoot "server.stdout.log"
 $serverStderr = Join-Path $testRoot "server.stderr.log"
 $server = $null
 $failed = $false
-$script:ExpectedCaseCount = 13
+$script:ExpectedCaseCount = 17
 $script:CaseCount = 0
 $script:PassedCaseCount = 0
 $script:CurrentCase = $null
@@ -84,6 +84,8 @@ try {
     Assert-True ($LASTEXITCODE -eq 0) "--help should exit successfully"
     Assert-True ($helpOutput.Contains("Usage:")) "--help should contain usage"
     Assert-True ($helpOutput.Contains("/exec/stream")) "--help should describe execution endpoints"
+    Assert-True ($helpOutput.Contains("/spawn/result")) "--help should describe asynchronous execution"
+    Assert-True ($helpOutput.Contains("/screenshot")) "--help should describe desktop endpoints"
     Assert-True ($helpOutput.Contains("script_mode")) "--help should describe script modes"
     Assert-True ($helpOutput.Contains("no authentication")) "--help should include the security warning"
 
@@ -127,6 +129,89 @@ try {
     }
     Assert-True $cmdResult.ok "cmd execution should succeed"
     Assert-True ($cmdResult.stdout.Contains("cmd-ok")) "cmd stdout should be returned"
+    Complete-E2ECase
+
+    Start-E2ECase "Asynchronous spawn and result polling"
+    $spawnResult = Invoke-JsonPost "/spawn" @{
+        command = "echo spawn-out & echo spawn-err 1>&2 & ping 127.0.0.1 -n 2 >nul"
+        timeout = 5000
+    }
+    Assert-True `
+        (-not [string]::IsNullOrWhiteSpace([string]$spawnResult.session_id)) `
+        "spawn should return a session ID"
+    Assert-True ($spawnResult.pid -gt 0) "spawn should return a PID"
+
+    $spawnQuery = $null
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+        $spawnQuery = Invoke-JsonPost "/spawn/result" @{
+            session_id = $spawnResult.session_id
+        }
+        if ($spawnQuery.status -notin @("starting", "running")) {
+            break
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    Assert-True ($spawnQuery.status -eq "exited") "spawned command should finish normally"
+    Assert-True ($spawnQuery.exit_code -eq 0) "spawned command should return exit code zero"
+    Assert-True ($spawnQuery.stdout.Contains("spawn-out")) "spawn result should contain stdout"
+    Assert-True ($spawnQuery.stderr.Contains("spawn-err")) "spawn result should contain stderr"
+    Assert-True (-not $spawnQuery.stdout_truncated) "small stdout should not be truncated"
+    $spawnDelta = Invoke-JsonPost "/spawn/result" @{
+        session_id = $spawnResult.session_id
+        stdout_offset = $spawnQuery.stdout_next_offset
+        stderr_offset = $spawnQuery.stderr_next_offset
+    }
+    Assert-True ($spawnDelta.stdout -eq "") "spawn stdout offset should return only new data"
+    Assert-True ($spawnDelta.stderr -eq "") "spawn stderr offset should return only new data"
+    Complete-E2ECase
+
+    Start-E2ECase "Primary-screen PNG screenshot"
+    $screenshotFile = Join-Path $testRoot "screenshot.png"
+    $screenshotStatus = 200
+    try {
+        Invoke-WebRequest `
+            -Method Post `
+            -Uri "$($script:BaseUri)/screenshot" `
+            -ContentType "application/json" `
+            -Body "{}" `
+            -OutFile $screenshotFile
+    }
+    catch {
+        $screenshotStatus = [int]$_.Exception.Response.StatusCode
+    }
+    Assert-True `
+        ($screenshotStatus -in @(200, 500)) `
+        "screenshot should return PNG or report an unavailable display"
+    if ($screenshotStatus -eq 200) {
+        $screenshotBytes = [System.IO.File]::ReadAllBytes($screenshotFile)
+        Assert-True ($screenshotBytes.Length -gt 8) "screenshot should contain PNG data"
+        Assert-True `
+            ($screenshotBytes[0] -eq 0x89 -and $screenshotBytes[1] -eq 0x50 -and `
+             $screenshotBytes[2] -eq 0x4e -and $screenshotBytes[3] -eq 0x47) `
+            "screenshot should have a PNG signature"
+    }
+    Complete-E2ECase
+
+    Start-E2ECase "Top-level window enumeration"
+    $windowsResult = Invoke-JsonPost "/windows" @{}
+    Assert-True ($null -ne $windowsResult.windows) "windows response should contain a window array"
+    $firstWindow = @($windowsResult.windows) | Select-Object -First 1
+    if ($null -ne $firstWindow) {
+        Assert-True ($firstWindow.hwnd.StartsWith("0x")) "window HWND should be hexadecimal"
+        Assert-True ($firstWindow.pid -ge 0) "window should include a PID"
+        Assert-True ($null -ne $firstWindow.rect) "window should include its rectangle"
+    }
+    Complete-E2ECase
+
+    Start-E2ECase "Control request validation"
+    $controlStatus = 0
+    try {
+        Invoke-JsonPost "/control" @{ actions = @() } | Out-Null
+    }
+    catch {
+        $controlStatus = [int]$_.Exception.Response.StatusCode
+    }
+    Assert-True ($controlStatus -eq 400) "control should reject an empty action list"
     Complete-E2ECase
 
     Start-E2ECase "Working directory"

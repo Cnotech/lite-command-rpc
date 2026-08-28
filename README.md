@@ -8,6 +8,8 @@ Lite Command RPC 是一个面向 Windows 的轻量级 HTTP 命令执行服务，
 ## 特性
 
 - 普通或流式执行 Windows 命令
+- 异步启动命令并通过会话查询状态和输出
+- 截取主屏幕 PNG、枚举顶级窗口、模拟键盘和鼠标输入
 - 支持设置工作目录和执行超时时间
 - 超时后终止整个命令进程树
 - 上传和下载文件
@@ -81,6 +83,11 @@ target\release\lcr.exe
 | --- | --- | --- |
 | `/exec` | 执行命令并一次性返回结果 | JSON |
 | `/exec/stream` | 执行命令并持续返回输出 | JSON |
+| `/spawn` | 异步启动命令，立即返回会话 ID 和 PID | JSON |
+| `/spawn/result` | 查询异步命令的状态和输出 | JSON |
+| `/screenshot` | 截取主屏幕并返回 PNG | 空请求体 |
+| `/windows` | 枚举当前桌面的顶级窗口 | 空请求体 |
+| `/control` | 聚焦窗口或模拟键盘、鼠标输入 | JSON |
 | `/download` | 下载指定文件 | JSON |
 | `/upload` | 上传文件到指定路径 | 二进制 |
 
@@ -180,6 +187,137 @@ CMD 临时脚本使用 `.cmd` 扩展名并切换至 UTF-8 代码页，PowerShell
 ```
 
 命令无法启动时会返回 `error` 事件。
+
+### 异步执行命令
+
+`POST /spawn` 的请求体与 `/exec` 相同。命令成功启动后立即返回 `202 Accepted`，不会等待命令执行完成：
+
+```json
+{
+  "session_id": "1234-1",
+  "pid": 5678,
+  "status": "running"
+}
+```
+
+使用 `POST /spawn/result` 查询运行状态和当前已经收集到的输出：
+
+```json
+{
+  "session_id": "1234-1",
+  "stdout_offset": 0,
+  "stderr_offset": 0
+}
+```
+
+响应示例：
+
+```json
+{
+  "session_id": "1234-1",
+  "pid": 5678,
+  "status": "exited",
+  "exit_code": 0,
+  "stdout_offset": 0,
+  "stdout_next_offset": 6,
+  "stdout_complete": true,
+  "stderr_offset": 0,
+  "stderr_next_offset": 0,
+  "stderr_complete": true,
+  "stdout": "done\r\n",
+  "stderr": "",
+  "stdout_truncated": false,
+  "stderr_truncated": false,
+  "error": null
+}
+```
+
+状态可能为 `starting`、`running`、`exited`、`timed_out` 或 `failed`。`stdout_offset` 和 `stderr_offset` 是可选的 UTF-8 字节偏移量，默认为 0；持续轮询时将上次返回的 `*_next_offset` 传入，即可只获取新增输出。每个流单次最多返回 1 MiB；若 `*_complete` 为 `false`，继续使用新的 `*_next_offset` 查询剩余内容。
+
+每个 stdout/stderr 最多保留 8 MiB，所有异步会话合计最多保留 64 MiB；超过限制时对应的 `*_truncated` 为 `true`。完成的会话通常保留 30 分钟，服务同时最多保存 128 个会话；达到会话上限时会优先淘汰最早完成的结果，只有 128 个会话都仍在运行时才拒绝新任务。异步命令必须成功加入 Job Object 才会报告启动成功，服务退出或命令超时时会终止对应进程树。
+
+### 截取屏幕
+
+`POST /screenshot` 截取当前主屏幕，直接返回 `image/png` 二进制数据。同一时间只会执行一个截图操作。当前接口仅面向单显示器、未锁屏的交互式 Windows PE 桌面。
+
+```powershell
+Invoke-WebRequest `
+  -Method Post `
+  -Uri http://127.0.0.1:9527/screenshot `
+  -ContentType "application/json" `
+  -Body "{}" `
+  -OutFile screenshot.png
+```
+
+### 枚举窗口
+
+`POST /windows` 返回 lcr 所在交互桌面上的顶级窗口：
+
+```json
+{
+  "foreground_hwnd": "0xA12BC",
+  "windows": [
+    {
+      "hwnd": "0xA12BC",
+      "pid": 1234,
+      "thread_id": 5678,
+      "title": "Command Prompt",
+      "rect": {
+        "left": 100,
+        "top": 80,
+        "right": 1100,
+        "bottom": 780,
+        "width": 1000,
+        "height": 700
+      },
+      "top_level": true,
+      "foreground": true,
+      "topmost": false,
+      "visible": true,
+      "enabled": true,
+      "minimized": false,
+      "maximized": false
+    }
+  ]
+}
+```
+
+`hwnd` 使用十六进制字符串表示，避免客户端语言的整数精度问题。
+
+### 控制窗口和输入
+
+`POST /control` 按数组顺序执行操作。同一时间只执行一个控制请求，以避免不同请求的键鼠动作交错：
+
+```json
+{
+  "actions": [
+    { "type": "focus_window", "hwnd": "0xA12BC" },
+    { "type": "keyboard", "key": "G" },
+    { "type": "text", "text": "hello 世界" },
+    { "type": "mouse_move", "x": 500, "y": 300 },
+    { "type": "mouse_click", "button": "left" },
+    { "type": "mouse_wheel", "delta": -120 }
+  ]
+}
+```
+
+支持的操作：
+
+| `type` | 字段 | 说明 |
+| --- | --- | --- |
+| `focus_window` | `hwnd` | 聚焦窗口；接受十六进制字符串、十进制字符串或整数 |
+| `keyboard` | `key`, `state` | 按键操作；`state` 可为 `down`、`up`、`press`，默认 `press` |
+| `text` | `text` | 使用 Unicode 键盘事件输入文本 |
+| `mouse_move` | `x`, `y` | 移动到主屏幕绝对坐标 |
+| `mouse_button` | `button`, `state` | 鼠标按键操作 |
+| `mouse_click` | `button` | 单击，`button` 默认为 `left` |
+| `mouse_wheel` | `delta` | 滚轮增量，通常以正负 120 为一格 |
+
+`button` 可为 `left`、`right` 或 `middle`。`keyboard.key` 支持单个 ASCII 字母/数字、`F1`–`F24`、十六进制虚拟键码，以及 `enter`、`tab`、`escape`、`space`、`backspace`、`ctrl`、`shift`、`alt`、`win`、方向键、`home`、`end`、`pageup`、`pagedown`、`insert` 和 `delete`。
+
+Windows 可能拒绝后台进程强制聚焦某些窗口，也可能因为权限级别阻止输入注入。发生失败时接口返回 `409 Conflict`，响应包含失败动作的索引和已完成动作数量；此前已经成功执行的动作不会回滚。
+
+每个请求最多包含 256 个动作，单个 `text` 动作最多包含 4096 个 UTF-16 代码单元。
 
 ### 下载文件
 
