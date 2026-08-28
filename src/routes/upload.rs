@@ -1,4 +1,7 @@
-use crate::http::{send_json_error, send_response};
+use crate::{
+    http::{send_json_error, send_response},
+    logger,
+};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -127,7 +130,7 @@ pub fn handle(
                 received += size;
             }
             Err(err) => {
-                eprintln!("upload read error: {err}");
+                logger::error(format_args!("upload read error: {err}"));
                 return;
             }
         }
@@ -154,7 +157,9 @@ pub fn handle(
         return;
     }
 
-    println!("uploaded: {destination} ({content_length} bytes)");
+    logger::info(format_args!(
+        "uploaded: {destination} ({content_length} bytes)"
+    ));
     let body = serde_json::json!({
         "ok": true,
         "path": destination,

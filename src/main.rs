@@ -1,4 +1,6 @@
+mod console;
 mod http;
+mod logger;
 mod process;
 mod routes;
 
@@ -104,7 +106,7 @@ fn handle_json_route(stream: &mut TcpStream, path: &str, prefetched: &[u8], cont
             return;
         }
         Err(err) => {
-            eprintln!("read body error: {err}");
+            logger::error(format_args!("read body error: {err}"));
             return;
         }
     };
@@ -119,7 +121,7 @@ fn handle_json_route(stream: &mut TcpStream, path: &str, prefetched: &[u8], cont
 
 fn handle_client(mut stream: TcpStream) {
     let peer = stream.peer_addr().ok();
-    println!("client connected: {:?}", peer);
+    logger::info(format_args!("client connected: {peer:?}"));
     let mut buffer = Vec::new();
     let mut temp = [0u8; 4096];
     let header_end = loop {
@@ -140,7 +142,7 @@ fn handle_client(mut stream: TcpStream) {
                 }
             }
             Err(err) => {
-                eprintln!("read error: {err}");
+                logger::error(format_args!("read error: {err}"));
                 return;
             }
         }
@@ -179,30 +181,33 @@ fn handle_client(mut stream: TcpStream) {
     } else {
         handle_json_route(&mut stream, &head.path, prefetched, head.content_length);
     }
-    println!("client disconnected: {:?}", peer);
+    logger::info(format_args!("client disconnected: {peer:?}"));
 }
 
 fn run_server(addr: SocketAddr) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    println!("lcr listening on http://{addr}");
+    logger::info(format_args!("lcr listening on http://{addr}"));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 thread::spawn(move || handle_client(stream));
             }
-            Err(err) => eprintln!("accept error: {err}"),
+            Err(err) => logger::error(format_args!("accept error: {err}")),
         }
     }
     Ok(())
 }
 
 fn main() -> ExitCode {
+    if let Err(err) = console::set_title("lcr") {
+        logger::warn(format_args!("failed to set console title: {err}"));
+    }
     let cli = Cli::parse();
     match cli.command {
         None | Some(CliCommand::Serve) => match run_server(cli.listen) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("failed to start lcr: {err}");
+                logger::error(format_args!("failed to start lcr: {err}"));
                 ExitCode::FAILURE
             }
         },

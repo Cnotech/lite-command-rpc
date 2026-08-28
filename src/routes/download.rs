@@ -1,4 +1,4 @@
-use crate::http::send_response;
+use crate::{http::send_response, logger};
 use serde::Deserialize;
 use std::{fs::File, io::Write, net::TcpStream, path::Path};
 
@@ -50,8 +50,8 @@ pub fn handle(stream: &mut TcpStream, body: &[u8]) {
         let _ = send_response(stream, "400 Bad Request", &body, "application/json");
         return;
     }
-    println!("downloading: {}", request.path);
+    logger::info(format_args!("downloading: {}", request.path));
     if let Err(err) = send_file_response(stream, path) {
-        eprintln!("download error: {err}");
+        logger::error(format_args!("download error: {err}"));
     }
 }

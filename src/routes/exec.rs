@@ -1,5 +1,6 @@
 use crate::{
     http::{finish_chunked_response, send_response, send_stream_event, start_chunked_response},
+    logger,
     process::{ExecRequest, run_command},
 };
 use serde::Serialize;
@@ -30,7 +31,7 @@ pub fn handle(stream: &mut TcpStream, body: &[u8]) {
     let Some(request) = parse_request(stream, body) else {
         return;
     };
-    println!("executing: {}", request.command);
+    logger::info(format_args!("executing: {}", request.command));
     let timeout_ms = request.timeout_ms();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -82,7 +83,7 @@ pub fn handle_stream(stream: &mut TcpStream, body: &[u8]) {
     let Some(request) = parse_request(stream, body) else {
         return;
     };
-    println!("stream executing: {}", request.command);
+    logger::info(format_args!("stream executing: {}", request.command));
     let timeout_ms = request.timeout_ms();
     if start_chunked_response(stream).is_err() {
         return;

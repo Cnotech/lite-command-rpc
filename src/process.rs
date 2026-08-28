@@ -1,3 +1,4 @@
+use crate::logger;
 use serde::{Deserialize, de};
 use std::{
     fs::{File, OpenOptions},
@@ -433,10 +434,10 @@ where
     let job = match ProcessJob::assign(&child) {
         Ok(job) => Some(job),
         Err(err) => {
-            eprintln!(
+            logger::error(format_args!(
                 "failed to assign process {} to Job Object: {err}",
                 child.id()
-            );
+            ));
             None
         }
     };

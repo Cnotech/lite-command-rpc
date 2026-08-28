@@ -197,6 +197,11 @@ try {
     $downloadHash = (Get-FileHash -Algorithm SHA256 $downloadedFile).Hash
     Assert-True ($sourceHash -eq $downloadHash) "downloaded file should match uploaded content"
 
+    $serverLog = Get-Content -Path $serverStdout -Raw
+    Assert-True `
+        ($serverLog -match "(?m)^\[info\] \d{2}:\d{2}:\d{2} lcr listening on http://") `
+        "server logs should contain the standard level and timestamp prefix"
+
     Write-Host "All lcr E2E tests passed."
 }
 catch {
