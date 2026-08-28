@@ -39,6 +39,26 @@ function ConvertFrom-Ndjson {
         ForEach-Object { $_ | ConvertFrom-Json }
 }
 
+function Start-E2ECase {
+    param([string]$Name)
+
+    $script:CaseCount++
+    $script:CurrentCase = $Name
+    $script:CurrentCaseTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-Host ("[e2e] START {0:D2}/{1:D2} {2}" -f `
+        $script:CaseCount, $script:ExpectedCaseCount, $Name)
+}
+
+function Complete-E2ECase {
+    $script:CurrentCaseTimer.Stop()
+    $script:PassedCaseCount++
+    Write-Host ("[e2e] PASS  {0:D2}/{1:D2} {2} ({3} ms)" -f `
+        $script:CaseCount, $script:ExpectedCaseCount, $script:CurrentCase, `
+        $script:CurrentCaseTimer.ElapsedMilliseconds)
+    $script:CurrentCase = $null
+    $script:CurrentCaseTimer = $null
+}
+
 $binary = (Resolve-Path "target/release/lcr.exe").Path
 $listenHost = "127.0.0.1"
 $listenPort = 19527
@@ -49,10 +69,17 @@ $serverStdout = Join-Path $testRoot "server.stdout.log"
 $serverStderr = Join-Path $testRoot "server.stderr.log"
 $server = $null
 $failed = $false
+$script:ExpectedCaseCount = 13
+$script:CaseCount = 0
+$script:PassedCaseCount = 0
+$script:CurrentCase = $null
+$script:CurrentCaseTimer = $null
+$totalTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 
 try {
+    Start-E2ECase "CLI help and command metadata"
     $helpOutput = (& $binary --help | Out-String)
     Assert-True ($LASTEXITCODE -eq 0) "--help should exit successfully"
     Assert-True ($helpOutput.Contains("Usage:")) "--help should contain usage"
@@ -63,7 +90,9 @@ try {
     $helpCommandOutput = (& $binary help | Out-String)
     Assert-True ($LASTEXITCODE -eq 0) "help command should exit successfully"
     Assert-True ($helpCommandOutput.Contains("0.0.0.0:9527")) "help command should describe the listener"
+    Complete-E2ECase
 
+    Start-E2ECase "Server startup with custom listen address"
     $server = Start-Process `
         -FilePath $binary `
         -ArgumentList @("serve", "--listen", $listenAddress, "--log-level", "debug") `
@@ -89,14 +118,18 @@ try {
             $client.Dispose()
         }
     }
-    Assert-True $ready "lcr should listen on port 9527"
+    Assert-True $ready "lcr should listen on $listenAddress"
+    Complete-E2ECase
 
+    Start-E2ECase "CMD execution"
     $cmdResult = Invoke-JsonPost "/exec" @{
         command = "echo cmd-ok"
     }
     Assert-True $cmdResult.ok "cmd execution should succeed"
     Assert-True ($cmdResult.stdout.Contains("cmd-ok")) "cmd stdout should be returned"
+    Complete-E2ECase
 
+    Start-E2ECase "Working directory"
     $workingDirectory = Join-Path $testRoot "working-directory"
     New-Item -ItemType Directory -Path $workingDirectory | Out-Null
     $cwdResult = Invoke-JsonPost "/exec" @{
@@ -107,14 +140,18 @@ try {
     Assert-True `
         ([string]::Equals($cwdResult.stdout.Trim(), $workingDirectory, [System.StringComparison]::OrdinalIgnoreCase)) `
         "command should run in the requested working directory"
+    Complete-E2ECase
 
+    Start-E2ECase "PowerShell interpreter"
     $pwshResult = Invoke-JsonPost "/exec" @{
         command = "Write-Output 'pwsh-ok'"
         interpreter = "pwsh"
     }
     Assert-True $pwshResult.ok "pwsh execution should succeed"
     Assert-True ($pwshResult.stdout.Contains("pwsh-ok")) "pwsh stdout should be returned"
+    Complete-E2ECase
 
+    Start-E2ECase "Absolute custom interpreter with script file"
     $python = (Get-Command python.exe).Source
     $customResult = Invoke-JsonPost "/exec" @{
         command = "print('custom-ok')"
@@ -123,7 +160,9 @@ try {
     }
     Assert-True $customResult.ok "absolute interpreter execution should succeed"
     Assert-True ($customResult.stdout.Contains("custom-ok")) "custom interpreter stdout should be returned"
+    Complete-E2ECase
 
+    Start-E2ECase "Automatic multiline CMD script"
     $multilineResult = Invoke-JsonPost "/exec" @{
         command = "@echo off`r`nset E2E_VALUE=multiline-ok`r`necho %E2E_VALUE%"
         interpreter = "cmd"
@@ -131,14 +170,18 @@ try {
     }
     Assert-True $multilineResult.ok "automatic multiline script execution should succeed"
     Assert-True ($multilineResult.stdout.Contains("multiline-ok")) "multiline stdout should be returned"
+    Complete-E2ECase
 
+    Start-E2ECase "Forced temporary script file"
     $forcedFileResult = Invoke-JsonPost "/exec" @{
         command = "echo forced-file-ok"
         script_mode = "file"
     }
     Assert-True $forcedFileResult.ok "forced file execution should succeed"
     Assert-True ($forcedFileResult.stdout.Contains("forced-file-ok")) "forced file stdout should be returned"
+    Complete-E2ECase
 
+    Start-E2ECase "Streaming stdout, stderr, and exit event"
     $streamResponse = Invoke-WebRequest `
         -Method Post `
         -Uri "$($script:BaseUri)/exec/stream" `
@@ -156,7 +199,9 @@ try {
         ($streamStderr.Contains("stream-err")) `
         "streaming stderr should be returned; response: $streamText"
     Assert-True ($exitEvent.exit_code -eq 0) "streaming exit event should be returned"
+    Complete-E2ECase
 
+    Start-E2ECase "Streaming timeout event"
     $streamTimeoutResponse = Invoke-WebRequest `
         -Method Post `
         -Uri "$($script:BaseUri)/exec/stream" `
@@ -166,14 +211,18 @@ try {
     $timeoutEvents = @(ConvertFrom-Ndjson $streamTimeoutText)
     $streamTimeoutEvent = $timeoutEvents | Where-Object { $_.type -eq "timeout" } | Select-Object -Last 1
     Assert-True ($streamTimeoutEvent.timeout -eq 100) "streaming timeout event should be returned"
+    Complete-E2ECase
 
+    Start-E2ECase "Non-streaming command timeout"
     $timeoutResult = Invoke-JsonPost "/exec" @{
         command = "ping 127.0.0.1 -n 6 >nul"
         timeout = 100
     }
     Assert-True $timeoutResult.timed_out "long-running command should time out"
     Assert-True (-not $timeoutResult.ok) "timed-out command should not be successful"
+    Complete-E2ECase
 
+    Start-E2ECase "Binary upload, conflict, and download"
     $sourceFile = Join-Path $testRoot "source.bin"
     $uploadedFile = Join-Path $testRoot "uploaded.bin"
     $downloadedFile = Join-Path $testRoot "downloaded.bin"
@@ -211,7 +260,9 @@ try {
     $sourceHash = (Get-FileHash -Algorithm SHA256 $sourceFile).Hash
     $downloadHash = (Get-FileHash -Algorithm SHA256 $downloadedFile).Hash
     Assert-True ($sourceHash -eq $downloadHash) "downloaded file should match uploaded content"
+    Complete-E2ECase
 
+    Start-E2ECase "Server log levels and execution lifecycle"
     $serverLog = Get-Content -Path $serverStdout -Raw
     Assert-True `
         ($serverLog -match "(?m)^\[info\] \d{2}:\d{2}:\d{2} lcr listening on http://") `
@@ -234,11 +285,29 @@ try {
     Assert-True `
         ($serverLog -match "(?m)^\[info\] \d{2}:\d{2}:\d{2} stream finished: timed_out=true, timeout=100ms") `
         "streaming execution should log its timeout status"
+    Complete-E2ECase
 
-    Write-Host "All lcr E2E tests passed."
+    $totalTimer.Stop()
+    Assert-True `
+        ($script:CaseCount -eq $script:ExpectedCaseCount) `
+        "all expected E2E cases should be started"
+    Assert-True `
+        ($script:PassedCaseCount -eq $script:ExpectedCaseCount) `
+        "all expected E2E cases should pass"
+    Write-Host ("[e2e] SUMMARY {0}/{1} cases passed ({2} ms total)" -f `
+        $script:PassedCaseCount, $script:CaseCount, $totalTimer.ElapsedMilliseconds)
 }
 catch {
     $failed = $true
+    $totalTimer.Stop()
+    if ($null -ne $script:CurrentCaseTimer) {
+        $script:CurrentCaseTimer.Stop()
+        Write-Host ("[e2e] FAIL  {0:D2}/{1:D2} {2} ({3} ms)" -f `
+            $script:CaseCount, $script:ExpectedCaseCount, $script:CurrentCase, `
+            $script:CurrentCaseTimer.ElapsedMilliseconds)
+    }
+    Write-Host ("[e2e] SUMMARY {0}/{1} cases passed before failure ({2} ms total)" -f `
+        $script:PassedCaseCount, $script:CaseCount, $totalTimer.ElapsedMilliseconds)
     throw
 }
 finally {
