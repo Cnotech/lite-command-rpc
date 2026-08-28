@@ -46,6 +46,15 @@ struct Cli {
     )]
     listen: SocketAddr,
 
+    /// Minimum level printed by the logger
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value_t = logger::Level::Info
+    )]
+    log_level: logger::Level,
+
     #[command(subcommand)]
     command: Option<CliCommand>,
 }
@@ -121,7 +130,7 @@ fn handle_json_route(stream: &mut TcpStream, path: &str, prefetched: &[u8], cont
 
 fn handle_client(mut stream: TcpStream) {
     let peer = stream.peer_addr().ok();
-    logger::info(format_args!("client connected: {peer:?}"));
+    logger::debug(format_args!("client connected: {peer:?}"));
     let mut buffer = Vec::new();
     let mut temp = [0u8; 4096];
     let header_end = loop {
@@ -181,7 +190,7 @@ fn handle_client(mut stream: TcpStream) {
     } else {
         handle_json_route(&mut stream, &head.path, prefetched, head.content_length);
     }
-    logger::info(format_args!("client disconnected: {peer:?}"));
+    logger::debug(format_args!("client disconnected: {peer:?}"));
 }
 
 fn run_server(addr: SocketAddr) -> std::io::Result<()> {
@@ -203,6 +212,7 @@ fn main() -> ExitCode {
         logger::warn(format_args!("failed to set console title: {err}"));
     }
     let cli = Cli::parse();
+    logger::set_level(cli.log_level);
     match cli.command {
         None | Some(CliCommand::Serve) => match run_server(cli.listen) {
             Ok(()) => ExitCode::SUCCESS,
@@ -224,6 +234,7 @@ mod tests {
         let cli = Cli::try_parse_from(["lcr"]).expect("arguments should be valid");
         assert_eq!(cli.command, None);
         assert_eq!(cli.listen, "0.0.0.0:9527".parse().unwrap());
+        assert_eq!(cli.log_level, logger::Level::Info);
     }
 
     #[test]
@@ -254,6 +265,17 @@ mod tests {
     #[test]
     fn invalid_listen_address_is_rejected() {
         assert!(Cli::try_parse_from(["lcr", "--listen", "localhost"]).is_err());
+    }
+
+    #[test]
+    fn log_level_is_configurable_globally() {
+        for arguments in [
+            vec!["lcr", "--log-level", "debug"],
+            vec!["lcr", "serve", "--log-level", "debug"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("log level should be valid");
+            assert_eq!(cli.log_level, logger::Level::Debug);
+        }
     }
 
     #[test]

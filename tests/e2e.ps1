@@ -66,7 +66,7 @@ try {
 
     $server = Start-Process `
         -FilePath $binary `
-        -ArgumentList @("serve", "--listen", $listenAddress) `
+        -ArgumentList @("serve", "--listen", $listenAddress, "--log-level", "debug") `
         -PassThru `
         -RedirectStandardOutput $serverStdout `
         -RedirectStandardError $serverStderr
@@ -216,6 +216,24 @@ try {
     Assert-True `
         ($serverLog -match "(?m)^\[info\] \d{2}:\d{2}:\d{2} lcr listening on http://") `
         "server logs should contain the standard level and timestamp prefix"
+    Assert-True `
+        ($serverLog -match "(?m)^\[debug\] \d{2}:\d{2}:\d{2} client connected:") `
+        "debug logging should be enabled by --log-level debug"
+    Assert-True `
+        ($serverLog -match "(?m)^\[info\] \d{2}:\d{2}:\d{2} execution finished: exit_code=Some\(0\), timed_out=false") `
+        "non-streaming execution should log its final status"
+    Assert-True `
+        ($serverLog -match "(?m)^\[info\] \d{2}:\d{2}:\d{2} stream stdout: .*stream-out") `
+        "streaming stdout content should be logged"
+    Assert-True `
+        ($serverLog -match "(?m)^\[info\] \d{2}:\d{2}:\d{2} stream stderr: .*stream-err") `
+        "streaming stderr content should be logged"
+    Assert-True `
+        ($serverLog -match "(?m)^\[info\] \d{2}:\d{2}:\d{2} stream finished: exit_code=Some\(0\), timed_out=false") `
+        "streaming execution should log its exit status"
+    Assert-True `
+        ($serverLog -match "(?m)^\[info\] \d{2}:\d{2}:\d{2} stream finished: timed_out=true, timeout=100ms") `
+        "streaming execution should log its timeout status"
 
     Write-Host "All lcr E2E tests passed."
 }

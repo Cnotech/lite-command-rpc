@@ -38,6 +38,17 @@ http://0.0.0.0:9527
 ```
 
 监听地址必须使用 `IP:端口` 格式；IPv6 地址需要写成 `[::1]:9527`。
+
+默认日志等级为 `info`，客户端连接和断开等调试信息不会输出。通过 `--log-level` 调整最低输出等级：
+
+```powershell
+.\lcr.exe --log-level debug
+.\lcr.exe serve --log-level warn
+```
+
+可选等级为 `debug`、`info`、`warn` 和 `error`。
+普通命令执行结束时会记录最终状态；流式执行会以 `info` 等级记录每个 stdout/stderr 数据块以及最终的退出、超时或错误状态。
+
 查看命令行帮助：
 
 ```powershell

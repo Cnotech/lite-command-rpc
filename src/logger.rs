@@ -1,20 +1,44 @@
-use std::{fmt::Display, io::Write};
+use clap::ValueEnum;
+use std::{
+    fmt::{Display, Formatter},
+    io::Write,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ValueEnum)]
+#[repr(u8)]
 pub enum Level {
-    Info,
-    Warn,
-    Error,
+    Debug = 0,
+    Info = 1,
+    Warn = 2,
+    Error = 3,
 }
+
+static MIN_LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 
 impl Level {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Debug => "debug",
             Self::Info => "info",
             Self::Warn => "warn",
             Self::Error => "error",
         }
     }
+}
+
+impl Display for Level {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+pub fn set_level(level: Level) {
+    MIN_LEVEL.store(level as u8, Ordering::Relaxed);
+}
+
+fn enabled(level: Level) -> bool {
+    level as u8 >= MIN_LEVEL.load(Ordering::Relaxed)
 }
 
 #[cfg(windows)]
@@ -72,15 +96,22 @@ fn write_lines(
 }
 
 pub fn log(level: Level, message: impl Display) {
+    if !enabled(level) {
+        return;
+    }
     let message = message.to_string();
     let time = local_time();
     let result = match level {
         Level::Error => write_lines(&mut std::io::stderr().lock(), level, time, &message),
-        Level::Info | Level::Warn => {
+        Level::Debug | Level::Info | Level::Warn => {
             write_lines(&mut std::io::stdout().lock(), level, time, &message)
         }
     };
     let _ = result;
+}
+
+pub fn debug(message: impl Display) {
+    log(Level::Debug, message);
 }
 
 pub fn info(message: impl Display) {
@@ -117,5 +148,13 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "[error] 23:59:01 one\n[error] 23:59:01 two\n"
         );
+    }
+
+    #[test]
+    fn default_level_ignores_debug_messages() {
+        assert!(!enabled(Level::Debug));
+        assert!(enabled(Level::Info));
+        assert!(enabled(Level::Warn));
+        assert!(enabled(Level::Error));
     }
 }
