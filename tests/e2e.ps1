@@ -69,7 +69,7 @@ $serverStdout = Join-Path $testRoot "server.stdout.log"
 $serverStderr = Join-Path $testRoot "server.stderr.log"
 $server = $null
 $failed = $false
-$script:ExpectedCaseCount = 17
+$script:ExpectedCaseCount = 18
 $script:CaseCount = 0
 $script:PassedCaseCount = 0
 $script:CurrentCase = $null
@@ -85,6 +85,7 @@ try {
     Assert-True ($helpOutput.Contains("Usage:")) "--help should contain usage"
     Assert-True ($helpOutput.Contains("/exec/stream")) "--help should describe execution endpoints"
     Assert-True ($helpOutput.Contains("/spawn/result")) "--help should describe asynchronous execution"
+    Assert-True ($helpOutput.Contains("/spawn/terminate")) "--help should describe spawn termination"
     Assert-True ($helpOutput.Contains("/screenshot")) "--help should describe desktop endpoints"
     Assert-True ($helpOutput.Contains("script_mode")) "--help should describe script modes"
     Assert-True ($helpOutput.Contains("no authentication")) "--help should include the security warning"
@@ -163,6 +164,65 @@ try {
     }
     Assert-True ($spawnDelta.stdout -eq "") "spawn stdout offset should return only new data"
     Assert-True ($spawnDelta.stderr -eq "") "spawn stderr offset should return only new data"
+    $completedTerminate = Invoke-JsonPost "/spawn/terminate" @{
+        session_id = $spawnResult.session_id
+    }
+    Assert-True ($completedTerminate.status -eq "exited") "terminate should preserve a completed task"
+    Complete-E2ECase
+
+    Start-E2ECase "Asynchronous spawn termination"
+    $terminateSpawn = Invoke-JsonPost "/spawn" @{
+        command = '$child = Start-Process ping.exe -ArgumentList @("127.0.0.1", "-n", "30") -PassThru; Write-Output "child-pid=$($child.Id)"; Wait-Process -Id $child.Id'
+        interpreter = "pwsh"
+        timeout = 60000
+    }
+    $childPid = $null
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+        $runningResult = Invoke-JsonPost "/spawn/result" @{
+            session_id = $terminateSpawn.session_id
+        }
+        if ($runningResult.stdout -match "child-pid=(\d+)") {
+            $childPid = [int]$Matches[1]
+            break
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    Assert-True ($childPid -gt 0) "spawn should report its child process PID"
+
+    $invalidOffsetStatus = 200
+    try {
+        Invoke-WebRequest `
+            -Method Post `
+            -Uri "$($script:BaseUri)/spawn/terminate" `
+            -ContentType "application/json" `
+            -Body (@{ session_id = $terminateSpawn.session_id; stdout_offset = 999999 } | ConvertTo-Json -Compress) |
+            Out-Null
+    }
+    catch {
+        $invalidOffsetStatus = [int]$_.Exception.Response.StatusCode
+    }
+    Assert-True ($invalidOffsetStatus -eq 400) "invalid terminate offset should be rejected"
+    Assert-True `
+        ($null -ne (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) `
+        "invalid terminate offset should not stop the task"
+
+    $terminateResult = Invoke-JsonPost "/spawn/terminate" @{
+        session_id = $terminateSpawn.session_id
+    }
+    Assert-True ($terminateResult.status -eq "terminated") "terminated spawn should report terminated"
+    Assert-True ($null -eq $terminateResult.exit_code) "terminated spawn should not report an exit code"
+    Assert-True ($terminateResult.stdout.Contains("child-pid=")) "termination should return captured stdout"
+    Start-Sleep -Milliseconds 50
+    Assert-True `
+        ($null -eq (Get-Process -Id $terminateSpawn.pid -ErrorAction SilentlyContinue)) `
+        "terminated spawn process should no longer exist"
+    Assert-True `
+        ($null -eq (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) `
+        "terminated spawn child process should no longer exist"
+    $terminatedQuery = Invoke-JsonPost "/spawn/result" @{
+        session_id = $terminateSpawn.session_id
+    }
+    Assert-True ($terminatedQuery.status -eq "terminated") "result should preserve terminated status"
     Complete-E2ECase
 
     Start-E2ECase "Primary-screen PNG screenshot"

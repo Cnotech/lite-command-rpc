@@ -85,6 +85,7 @@ target\release\lcr.exe
 | `/exec/stream` | 执行命令并持续返回输出 | JSON |
 | `/spawn` | 异步启动命令，立即返回会话 ID 和 PID | JSON |
 | `/spawn/result` | 查询异步命令的状态和输出 | JSON |
+| `/spawn/terminate` | 终止异步命令并返回最终结果 | JSON |
 | `/screenshot` | 截取主屏幕并返回 PNG | 空请求体 |
 | `/windows` | 枚举当前桌面的顶级窗口 | 空请求体 |
 | `/control` | 聚焦窗口或模拟键盘、鼠标输入 | JSON |
@@ -232,9 +233,19 @@ CMD 临时脚本使用 `.cmd` 扩展名并切换至 UTF-8 代码页，PowerShell
 }
 ```
 
-状态可能为 `starting`、`running`、`exited`、`timed_out` 或 `failed`。`stdout_offset` 和 `stderr_offset` 是可选的 UTF-8 字节偏移量，默认为 0；持续轮询时将上次返回的 `*_next_offset` 传入，即可只获取新增输出。每个流单次最多返回 1 MiB；若 `*_complete` 为 `false`，继续使用新的 `*_next_offset` 查询剩余内容。
+状态可能为 `starting`、`running`、`terminating`、`terminated`、`exited`、`timed_out` 或 `failed`。`stdout_offset` 和 `stderr_offset` 是可选的 UTF-8 字节偏移量，默认为 0；持续轮询时将上次返回的 `*_next_offset` 传入，即可只获取新增输出。每个流单次最多返回 1 MiB；若 `*_complete` 为 `false`，继续使用新的 `*_next_offset` 查询剩余内容。
 
 每个 stdout/stderr 最多保留 8 MiB，所有异步会话合计最多保留 64 MiB；超过限制时对应的 `*_truncated` 为 `true`。完成的会话通常保留 30 分钟，服务同时最多保存 128 个会话；达到会话上限时会优先淘汰最早完成的结果，只有 128 个会话都仍在运行时才拒绝新任务。异步命令必须成功加入 Job Object 才会报告启动成功，服务退出或命令超时时会终止对应进程树。
+
+使用 `POST /spawn/terminate` 主动终止异步任务。请求字段与 `/spawn/result` 相同，至少提供 `session_id`：
+
+```json
+{
+  "session_id": "1234-1"
+}
+```
+
+接口会终止该任务的 Job Object 进程树，等待状态收敛后返回与 `/spawn/result` 相同的结果结构。主动结束的任务状态为 `terminated`、`exit_code` 为 `null`。对已经结束的任务重复调用时不会改变结果，会直接返回现有最终状态。
 
 ### 截取屏幕
 

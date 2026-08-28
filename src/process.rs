@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
     thread,
@@ -81,6 +81,7 @@ impl ExecRequest {
 pub struct RunResult {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    pub terminated: bool,
 }
 
 enum OutputMessage {
@@ -152,6 +153,30 @@ impl ProcessJob {
             Err(std::io::Error::last_os_error())
         } else {
             Ok(())
+        }
+    }
+
+    fn active_processes(&self) -> std::io::Result<u32> {
+        use std::mem::zeroed;
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
+        if unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectBasicAccountingInformation,
+                &mut accounting as *mut _ as *mut _,
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(accounting.ActiveProcesses)
         }
     }
 }
@@ -236,23 +261,30 @@ where
 }
 
 #[cfg(windows)]
-fn terminate_process_tree(child: &mut Child, job: Option<&ProcessJob>) {
-    if let Some(job) = job
-        && job.terminate().is_ok()
-    {
-        return;
+fn terminate_process_tree(child: &mut Child, job: Option<&ProcessJob>) -> std::io::Result<()> {
+    if let Some(job) = job {
+        return job.terminate();
     }
-    let _ = Command::new("taskkill")
+    let taskkill = Command::new("taskkill")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let _ = child.kill();
+    if taskkill.is_ok_and(|status| status.success()) {
+        return Ok(());
+    }
+    child.kill().or_else(|err| {
+        if err.kind() == std::io::ErrorKind::InvalidInput {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    })
 }
 
 #[cfg(not(windows))]
-fn terminate_process_tree(child: &mut Child, _job: Option<&ProcessJob>) {
-    let _ = child.kill();
+fn terminate_process_tree(child: &mut Child, _job: Option<&ProcessJob>) -> std::io::Result<()> {
+    child.kill()
 }
 
 fn is_windows_absolute_path(path: &str) -> bool {
@@ -424,11 +456,12 @@ pub fn run_command<F>(req: &ExecRequest, on_output: F) -> std::io::Result<RunRes
 where
     F: FnMut(bool, &[u8]) -> std::io::Result<()>,
 {
-    run_command_inner(req, false, |_| {}, on_output)
+    run_command_inner(req, false, None, |_| {}, on_output)
 }
 
 pub fn run_command_observed<S, F>(
     req: &ExecRequest,
+    cancellation: &AtomicBool,
     on_started: S,
     on_output: F,
 ) -> std::io::Result<RunResult>
@@ -436,12 +469,13 @@ where
     S: FnOnce(u32),
     F: FnMut(bool, &[u8]) -> std::io::Result<()>,
 {
-    run_command_inner(req, true, on_started, on_output)
+    run_command_inner(req, true, Some(cancellation), on_started, on_output)
 }
 
 fn run_command_inner<S, F>(
     req: &ExecRequest,
     require_job: bool,
+    cancellation: Option<&AtomicBool>,
     on_started: S,
     mut on_output: F,
 ) -> std::io::Result<RunResult>
@@ -464,7 +498,7 @@ where
                 child.id()
             );
             logger::error(format_args!("{message}"));
-            terminate_process_tree(&mut child, None);
+            let _ = terminate_process_tree(&mut child, None);
             let _ = child.wait();
             return Err(std::io::Error::new(err.kind(), message));
         }
@@ -488,30 +522,44 @@ where
         .checked_add(Duration::from_millis(timeout_ms))
         .unwrap_or_else(Instant::now);
     let mut timed_out = false;
+    let mut terminated = false;
     let mut process_status = None;
     let mut closed_pipes = 0;
     while process_status.is_none() || closed_pipes < 2 {
+        if process_status.is_none() {
+            process_status = child.try_wait()?;
+        }
         if !timed_out
+            && !terminated
+            && cancellation.is_some_and(|value| value.load(Ordering::Relaxed))
+        {
+            let active_processes = job
+                .as_ref()
+                .expect("observed commands require a Job Object")
+                .active_processes()?;
+            if active_processes > 0 {
+                terminate_process_tree(&mut child, job.as_ref())?;
+                terminated = true;
+            }
+        } else if !timed_out
+            && !terminated
             && (process_status.is_none() || closed_pipes < 2)
             && Instant::now() >= deadline
         {
+            terminate_process_tree(&mut child, job.as_ref())?;
             timed_out = true;
-            terminate_process_tree(&mut child, job.as_ref());
-        }
-        if process_status.is_none() {
-            process_status = child.try_wait()?;
         }
         match receiver.recv_timeout(POLL_INTERVAL) {
             Ok(OutputMessage::Stdout(data)) => {
                 if let Err(err) = on_output(true, &data) {
-                    terminate_process_tree(&mut child, job.as_ref());
+                    let _ = terminate_process_tree(&mut child, job.as_ref());
                     let _ = child.wait();
                     return Err(err);
                 }
             }
             Ok(OutputMessage::Stderr(data)) => {
                 if let Err(err) = on_output(false, &data) {
-                    terminate_process_tree(&mut child, job.as_ref());
+                    let _ = terminate_process_tree(&mut child, job.as_ref());
                     let _ = child.wait();
                     return Err(err);
                 }
@@ -526,8 +574,13 @@ where
         None => child.wait()?,
     };
     Ok(RunResult {
-        exit_code: if timed_out { None } else { status.code() },
+        exit_code: if timed_out || terminated {
+            None
+        } else {
+            status.code()
+        },
         timed_out,
+        terminated,
     })
 }
 

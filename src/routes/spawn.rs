@@ -9,7 +9,7 @@ use std::{
     net::TcpStream,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -19,6 +19,8 @@ use std::{
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOTAL_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RESULT_STREAM_BYTES: usize = 1024 * 1024;
+const TERMINATE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const COMPLETED_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_SESSIONS: usize = 128;
 
@@ -32,9 +34,20 @@ static RESULT_RESPONSE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 enum SessionStatus {
     Starting,
     Running,
+    Terminating,
+    Terminated,
     Exited,
     TimedOut,
     Failed,
+}
+
+impl SessionStatus {
+    fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Terminated | Self::Exited | Self::TimedOut | Self::Failed
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -48,6 +61,7 @@ struct Session {
     stderr_truncated: bool,
     error: Option<String>,
     finished_at: Option<Instant>,
+    cancellation: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -62,6 +76,7 @@ impl Session {
             stderr_truncated: false,
             error: None,
             finished_at: None,
+            cancellation: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -240,11 +255,18 @@ pub fn handle_spawn(stream: &mut TcpStream, body: &[u8]) {
 
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let worker_session = Arc::clone(&session);
+    let cancellation = {
+        let session = session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&session.cancellation)
+    };
     let worker_id = session_id.clone();
     thread::spawn(move || {
         let mut start_sender = Some(started_tx);
         let result = run_command_observed(
             &request,
+            &cancellation,
             |pid| {
                 {
                     let mut session = worker_session
@@ -286,7 +308,9 @@ pub fn handle_spawn(stream: &mut TcpStream, body: &[u8]) {
         match result {
             Ok(result) => {
                 session.exit_code = result.exit_code;
-                session.status = if result.timed_out {
+                session.status = if result.terminated {
+                    SessionStatus::Terminated
+                } else if result.timed_out {
                     SessionStatus::TimedOut
                 } else {
                     SessionStatus::Exited
@@ -344,27 +368,31 @@ pub fn handle_spawn(stream: &mut TcpStream, body: &[u8]) {
     }
 }
 
-pub fn handle_result(stream: &mut TcpStream, body: &[u8]) {
-    let request: ResultRequest = match serde_json::from_slice(body) {
-        Ok(request) => request,
+fn parse_result_request(stream: &mut TcpStream, body: &[u8]) -> Option<ResultRequest> {
+    match serde_json::from_slice(body) {
+        Ok(request) => Some(request),
         Err(err) => {
             send_json_error(stream, "400 Bad Request", &format!("invalid json: {err}"));
-            return;
+            None
         }
-    };
+    }
+}
+
+fn find_session(session_id: &str) -> Option<Arc<Mutex<Session>>> {
+    let mut registry = lock_sessions();
+    cleanup_sessions(&mut registry);
+    registry.get(session_id).cloned()
+}
+
+fn send_session_result(
+    stream: &mut TcpStream,
+    request: &ResultRequest,
+    session: Arc<Mutex<Session>>,
+) {
     let result_lock = RESULT_RESPONSE_LOCK.get_or_init(|| Mutex::new(()));
     let _result_guard = result_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let session = {
-        let mut registry = lock_sessions();
-        cleanup_sessions(&mut registry);
-        registry.get(&request.session_id).cloned()
-    };
-    let Some(session) = session else {
-        send_json_error(stream, "404 Not Found", "spawn session not found");
-        return;
-    };
     let response = {
         let session = session
             .lock()
@@ -412,6 +440,83 @@ pub fn handle_result(stream: &mut TcpStream, body: &[u8]) {
     let _ = send_response(stream, "200 OK", &body, "application/json");
 }
 
+fn result_offsets_are_valid(session: &Session, request: &ResultRequest) -> bool {
+    result_chunk_end(&session.stdout, request.stdout_offset).is_some()
+        && result_chunk_end(&session.stderr, request.stderr_offset).is_some()
+}
+
+pub fn handle_result(stream: &mut TcpStream, body: &[u8]) {
+    let Some(request) = parse_result_request(stream, body) else {
+        return;
+    };
+    let Some(session) = find_session(&request.session_id) else {
+        send_json_error(stream, "404 Not Found", "spawn session not found");
+        return;
+    };
+    send_session_result(stream, &request, session);
+}
+
+pub fn handle_terminate(stream: &mut TcpStream, body: &[u8]) {
+    let Some(request) = parse_result_request(stream, body) else {
+        return;
+    };
+    let Some(session) = find_session(&request.session_id) else {
+        send_json_error(stream, "404 Not Found", "spawn session not found");
+        return;
+    };
+
+    let should_wait = {
+        let mut state = session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !result_offsets_are_valid(&state, &request) {
+            drop(state);
+            send_json_error(
+                stream,
+                "400 Bad Request",
+                "stdout_offset or stderr_offset exceeds the captured output or splits a UTF-8 character",
+            );
+            return;
+        }
+        if state.status.is_terminal() {
+            false
+        } else {
+            state.status = SessionStatus::Terminating;
+            state.cancellation.store(true, Ordering::Relaxed);
+            true
+        }
+    };
+
+    if should_wait {
+        logger::info(format_args!(
+            "terminating spawn session: session_id={}",
+            request.session_id
+        ));
+        let deadline = Instant::now() + TERMINATE_WAIT_TIMEOUT;
+        loop {
+            let terminated = session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .status
+                .is_terminal();
+            if terminated {
+                break;
+            }
+            if Instant::now() >= deadline {
+                send_json_error(
+                    stream,
+                    "500 Internal Server Error",
+                    "spawn session did not terminate within 30 seconds",
+                );
+                return;
+            }
+            thread::sleep(TERMINATE_POLL_INTERVAL);
+        }
+    }
+
+    send_session_result(stream, &request, session);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +551,20 @@ mod tests {
             result_chunk_end(&output, MAX_RESULT_STREAM_BYTES - 1),
             Some(output.len())
         );
+    }
+
+    #[test]
+    fn termination_validates_offsets_before_cancelling() {
+        let mut session = Session::new();
+        session.stdout.extend_from_slice("世界".as_bytes());
+        let request = ResultRequest {
+            session_id: "test".to_string(),
+            stdout_offset: 1,
+            stderr_offset: 0,
+        };
+
+        assert!(!result_offsets_are_valid(&session, &request));
+        assert!(!session.cancellation.load(Ordering::Relaxed));
     }
 
     #[test]

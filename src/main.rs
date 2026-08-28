@@ -24,6 +24,7 @@ use std::{
 ///   /exec/stream  Execute a command and return NDJSON events
 ///   /spawn        Start a command asynchronously and return its session ID and PID
 ///   /spawn/result Query an asynchronous command and its captured output
+///   /spawn/terminate Terminate an asynchronous command and return its result
 ///   /screenshot   Capture the primary screen as PNG
 ///   /windows      List top-level windows on the current desktop
 ///   /control      Focus a window or simulate keyboard and mouse input
@@ -130,6 +131,7 @@ fn handle_json_route(stream: &mut TcpStream, path: &str, prefetched: &[u8], cont
         "/exec/stream" => routes::exec::handle_stream(stream, &body),
         "/spawn" => routes::spawn::handle_spawn(stream, &body),
         "/spawn/result" => routes::spawn::handle_result(stream, &body),
+        "/spawn/terminate" => routes::spawn::handle_terminate(stream, &body),
         #[cfg(windows)]
         "/screenshot" => routes::screenshot::handle(stream),
         #[cfg(windows)]
@@ -298,6 +300,7 @@ mod tests {
             "http://0.0.0.0:9527",
             "/exec/stream",
             "/spawn/result",
+            "/spawn/terminate",
             "/screenshot",
             "/windows",
             "/control",
