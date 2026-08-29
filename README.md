@@ -104,6 +104,14 @@ Content-Type: application/json
 }
 ```
 
+请求示例：
+
+```powershell
+curl -X POST http://127.0.0.1:9527/exec `
+  -H "Content-Type: application/json" `
+  --data-raw '{"command":"tasklist","cwd":"D:\\Desktop","timeout":300000,"interpreter":"cmd","script_mode":"auto"}'
+```
+
 字段说明：
 
 | 字段 | 必填 | 说明 |
@@ -171,6 +179,12 @@ CMD 临时脚本使用 `.cmd` 扩展名并切换至 UTF-8 代码页，PowerShell
 
 `POST /exec/stream` 的请求体与 `/exec` 相同。响应使用 HTTP Chunked 传输，内容类型为 NDJSON，每行是一个独立事件：
 
+```powershell
+curl --no-buffer -X POST http://127.0.0.1:9527/exec/stream `
+  -H "Content-Type: application/json" `
+  --data-raw '{"command":"ping 127.0.0.1 -n 4","interpreter":"cmd"}'
+```
+
 ```jsonl
 {"type":"stdout","data":"hello\r\n"}
 {"type":"stderr","data":"warning\r\n"}
@@ -189,6 +203,12 @@ CMD 临时脚本使用 `.cmd` 扩展名并切换至 UTF-8 代码页，PowerShell
 
 `POST /spawn` 的请求体与 `/exec` 相同。命令成功启动后立即返回 `202 Accepted`，不会等待命令执行完成：
 
+```powershell
+curl -X POST http://127.0.0.1:9527/spawn `
+  -H "Content-Type: application/json" `
+  --data-raw '{"command":"ping 127.0.0.1 -n 10","interpreter":"cmd"}'
+```
+
 ```json
 {
   "session_id": "1234-1",
@@ -198,6 +218,12 @@ CMD 临时脚本使用 `.cmd` 扩展名并切换至 UTF-8 代码页，PowerShell
 ```
 
 使用 `POST /spawn/result` 查询运行状态和当前已经收集到的输出：
+
+```powershell
+curl -X POST http://127.0.0.1:9527/spawn/result `
+  -H "Content-Type: application/json" `
+  --data-raw '{"session_id":"1234-1","stdout_offset":0,"stderr_offset":0}'
+```
 
 ```json
 {
@@ -235,6 +261,12 @@ CMD 临时脚本使用 `.cmd` 扩展名并切换至 UTF-8 代码页，PowerShell
 
 使用 `POST /spawn/terminate` 主动终止异步任务。请求字段与 `/spawn/result` 相同，至少提供 `session_id`：
 
+```powershell
+curl -X POST http://127.0.0.1:9527/spawn/terminate `
+  -H "Content-Type: application/json" `
+  --data-raw '{"session_id":"1234-1"}'
+```
+
 ```json
 {
   "session_id": "1234-1"
@@ -248,12 +280,8 @@ CMD 临时脚本使用 `.cmd` 扩展名并切换至 UTF-8 代码页，PowerShell
 `POST /screenshot` 截取当前主屏幕，直接返回 `image/png` 二进制数据。同一时间只会执行一个截图操作。默认桌面 DC 截图失败时，会自动回退到 `DISPLAY` 设备 DC 和兼容位图路径；若请求线程不在交互式桌面，还会尝试切换到当前输入桌面后重试，以适配部分 WinPE 图形环境。当前接口仅面向单显示器、未锁屏的交互式 Windows PE 桌面。
 
 ```powershell
-Invoke-WebRequest `
-  -Method Post `
-  -Uri http://127.0.0.1:9527/screenshot `
-  -ContentType "application/json" `
-  -Body "{}" `
-  -OutFile screenshot.png
+curl -X POST http://127.0.0.1:9527/screenshot `
+  --output screenshot.png
 ```
 
 ### 枚举窗口
@@ -291,6 +319,12 @@ Invoke-WebRequest `
 
 `hwnd` 使用十六进制字符串表示，避免客户端语言的整数精度问题。
 
+请求示例：
+
+```powershell
+curl -X POST http://127.0.0.1:9527/windows
+```
+
 ### 控制窗口和输入
 
 `POST /control` 在当前输入桌面按数组顺序执行操作。同一时间只执行一个控制请求，以避免不同请求的键鼠动作交错。相邻动作之间默认等待 50 毫秒，减少聚焦后紧接着输入时被 Windows 丢弃的概率；可通过顶层 `delay` 字段配置毫秒数，设为 0 可关闭等待，单次间隔最大为 5000，整个请求的累计动作间延迟不得超过 30000 毫秒：
@@ -307,6 +341,14 @@ Invoke-WebRequest `
     { "type": "mouse_wheel", "delta": -120 }
   ]
 }
+```
+
+请求示例：
+
+```powershell
+curl -X POST http://127.0.0.1:9527/control `
+  -H "Content-Type: application/json" `
+  --data-raw '{"delay":100,"actions":[{"type":"focus_window","hwnd":"0xA12BC"},{"type":"text","text":"hello 世界"},{"type":"mouse_click","button":"left"}]}'
 ```
 
 `delay_ms` 可作为 `delay` 的兼容别名。延迟只发生在两个动作之间，单个动作或最后一个动作后不会额外等待。
@@ -344,6 +386,15 @@ Content-Type: application/json
 }
 ```
 
+请求示例：
+
+```powershell
+curl -X POST http://127.0.0.1:9527/download `
+  -H "Content-Type: application/json" `
+  --data-raw '{"path":"D:\\Desktop\\test.7z"}' `
+  --output test.7z
+```
+
 成功后响应体即为文件的二进制内容。
 
 ### 上传文件
@@ -351,7 +402,7 @@ Content-Type: application/json
 请求体直接传输文件内容，通过 `X-File-Path` 请求头指定目标路径：
 
 ```powershell
-curl.exe http://127.0.0.1:9527/upload `
+curl -X POST http://127.0.0.1:9527/upload `
   -H "Content-Type: application/octet-stream" `
   -H "X-File-Path: D:\Desktop\uploaded.7z" `
   --data-binary "@D:\Download\source.7z"
