@@ -19,7 +19,7 @@ Lite Command RPC 是一个面向 Windows 的轻量级 HTTP 命令执行服务，
 
 ## 使用
 
-，解压后运行：
+解压后运行：
 
 ```powershell
 .\lcr.exe
@@ -30,22 +30,6 @@ Lite Command RPC 是一个面向 Windows 的轻量级 HTTP 命令执行服务，
 ```powershell
 .\lcr.exe --listen 127.0.0.1:9527
 .\lcr.exe --listen [::1]:9527
-```
-
-默认日志等级为 `info`，客户端连接和断开等调试信息不会输出。通过 `--log-level` 调整最低输出等级：
-
-```powershell
-.\lcr.exe --log-level debug
-.\lcr.exe serve --log-level warn
-```
-
-可选等级为 `debug`、`info`、`warn` 和 `error`。
-普通命令执行结束时会记录最终状态；流式执行会以 `info` 等级记录每个 stdout/stderr 数据块以及最终的退出、超时或错误状态。
-
-查看命令行帮助：
-
-```powershell
-.\lcr.exe --help
 ```
 
 也可以使用 `.\lcr.exe serve` 显式启动服务；其行为与不带参数运行相同。
@@ -82,8 +66,6 @@ target\release\lcr.exe
 | `/control` | 聚焦窗口或模拟键盘、鼠标输入 | JSON |
 | `/download` | 下载指定文件 | JSON |
 | `/upload` | 上传文件到指定路径 | 二进制 |
-
-请求类型标为“空请求体”的接口不要求发送 `Content-Length`；缺少该请求头时按长度 0 处理。服务暂不支持任何请求 `Transfer-Encoding`，携带该请求头会返回 `400 Bad Request`。
 
 ### 执行命令
 
@@ -277,7 +259,7 @@ curl -X POST http://127.0.0.1:9527/spawn/terminate `
 
 ### 截取屏幕
 
-`POST /screenshot` 截取当前主屏幕，直接返回 `image/png` 二进制数据。同一时间只会执行一个截图操作。默认桌面 DC 截图失败时，会自动回退到 `DISPLAY` 设备 DC 和兼容位图路径；若请求线程不在交互式桌面，还会尝试切换到当前输入桌面后重试，以适配部分 WinPE 图形环境。当前接口仅面向单显示器、未锁屏的交互式 Windows PE 桌面。
+`POST /screenshot` 截取当前主屏幕，直接返回 `image/png` 二进制数据。
 
 ```powershell
 curl -X POST http://127.0.0.1:9527/screenshot `
@@ -286,7 +268,7 @@ curl -X POST http://127.0.0.1:9527/screenshot `
 
 ### 枚举窗口
 
-`POST /windows` 返回当前输入桌面上的顶级窗口。即使 lcr 的请求线程继承了非交互桌面，也会切换到正在接收用户输入的桌面后再枚举：
+`POST /windows` 返回当前输入桌面上的窗口信息。：
 
 ```json
 {
