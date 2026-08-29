@@ -69,23 +69,6 @@ target\release\lcr.exe
 
 ### 执行命令
 
-请求：
-
-```http
-POST /exec
-Content-Type: application/json
-```
-
-```json
-{
-  "command": "tasklist",
-  "cwd": "D:\\Desktop",
-  "timeout": 300000,
-  "interpreter": "cmd",
-  "script_mode": "auto"
-}
-```
-
 请求示例：
 
 ```powershell
@@ -167,6 +150,8 @@ curl --no-buffer -X POST http://127.0.0.1:9527/exec/stream `
   --data-raw '{"command":"ping 127.0.0.1 -n 4","interpreter":"cmd"}'
 ```
 
+响应示例：
+
 ```jsonl
 {"type":"stdout","data":"hello\r\n"}
 {"type":"stderr","data":"warning\r\n"}
@@ -191,6 +176,8 @@ curl -X POST http://127.0.0.1:9527/spawn `
   --data-raw '{"command":"ping 127.0.0.1 -n 10","interpreter":"cmd"}'
 ```
 
+响应示例：
+
 ```json
 {
   "session_id": "1234-1",
@@ -205,14 +192,6 @@ curl -X POST http://127.0.0.1:9527/spawn `
 curl -X POST http://127.0.0.1:9527/spawn/result `
   -H "Content-Type: application/json" `
   --data-raw '{"session_id":"1234-1","stdout_offset":0,"stderr_offset":0}'
-```
-
-```json
-{
-  "session_id": "1234-1",
-  "stdout_offset": 0,
-  "stderr_offset": 0
-}
 ```
 
 响应示例：
@@ -249,12 +228,6 @@ curl -X POST http://127.0.0.1:9527/spawn/terminate `
   --data-raw '{"session_id":"1234-1"}'
 ```
 
-```json
-{
-  "session_id": "1234-1"
-}
-```
-
 接口会终止该任务的 Job Object 进程树，等待状态收敛后返回与 `/spawn/result` 相同的结果结构。主动结束的任务状态为 `terminated`、`exit_code` 为 `null`。对已经结束的任务重复调用时不会改变结果，会直接返回现有最终状态。
 
 ### 截取屏幕
@@ -268,7 +241,7 @@ curl -X POST http://127.0.0.1:9527/screenshot `
 
 ### 枚举窗口
 
-`POST /windows` 返回当前输入桌面上的窗口信息。：
+`POST /windows` 返回当前输入桌面上的窗口信息：
 
 ```json
 {
@@ -330,7 +303,7 @@ curl -X POST http://127.0.0.1:9527/windows
 ```powershell
 curl -X POST http://127.0.0.1:9527/control `
   -H "Content-Type: application/json" `
-  --data-raw '{"delay":100,"actions":[{"type":"focus_window","hwnd":"0xA12BC"},{"type":"text","text":"hello 世界"},{"type":"mouse_click","button":"left"}]}'
+  --data-raw '{"delay":100,"actions":[{"type":"focus_window","hwnd":"0xA12BC"},{"type":"keyboard","key":"G"},{"type":"text","text":"hello 世界"},{"type":"mouse_move","x":500,"y":300},{"type":"mouse_click","button":"left"},{"type":"mouse_wheel","delta":-120}]}'
 ```
 
 `delay_ms` 可作为 `delay` 的兼容别名。延迟只发生在两个动作之间，单个动作或最后一个动作后不会额外等待。
@@ -354,19 +327,6 @@ Windows 可能拒绝后台进程强制聚焦某些窗口，也可能因为权限
 每个请求最多包含 256 个动作，单个 `text` 动作最多包含 4096 个 UTF-16 代码单元。
 
 ### 下载文件
-
-请求：
-
-```http
-POST /download
-Content-Type: application/json
-```
-
-```json
-{
-  "path": "D:\\Desktop\\test.7z"
-}
-```
 
 请求示例：
 
