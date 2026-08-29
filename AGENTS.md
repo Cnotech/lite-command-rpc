@@ -7,7 +7,7 @@
 ## 开发约定
 
 - 保持实现简单，优先使用标准库，谨慎增加依赖。
-- 修改接口时同步更新 `README.md` 和 e2e 测试脚本。
+- 修改功能时需考虑更新 `README.md`、`.agents\skills\lcr\SKILL.md` 和 e2e 测试脚本。
 - Windows 专属代码使用 `#[cfg(windows)]` 标记；不要破坏命令超时后终止进程树的行为。
 - 提交前在 Windows 环境运行 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings` 和 `cargo test`。
 - 不要提交 `target/` 目录或本地生成的二进制、压缩包。

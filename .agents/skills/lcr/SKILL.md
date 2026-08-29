@@ -5,7 +5,7 @@ description: Use Lite Command RPC (lcr) on Windows to execute commands, manage a
 
 # LCR
 
-使用 LCR 在 Windows 主机上通过 HTTP 执行操作，服务默认端口为 `9527`。
+使用 [Lite Command RPC](https://github.com/Cnotech/lite-command-rpc) 在需要被调试的 Windows 主机上通过 HTTP 执行操作，服务默认端口为 `9527`。
 
 所有接口均为 `POST`。以下示例省略重复的 `curl -X POST http://127.0.0.1:9527` 前缀。
 
