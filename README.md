@@ -7,39 +7,30 @@ Lite Command RPC 是一个面向 Windows 的轻量级 HTTP 命令执行服务，
 
 ## 特性
 
-- 普通或流式执行 Windows 命令
-- 异步启动命令并通过会话查询状态和输出
-- 截取主屏幕 PNG、枚举顶级窗口、模拟键盘和鼠标输入
-- 支持设置工作目录和执行超时时间
-- 超时后终止整个命令进程树
+- 普通或流式或异步执行 Windows 命令
+- 屏幕截图
+- 窗口枚举
+- 模拟键盘和鼠标输入
 - 上传和下载文件
-- 支持 `cmd`、PowerShell 7 和自定义解释器
-- 自动通过临时文件执行多行脚本
-- 支持配置监听 IP 和端口
-- 单文件部署，无额外运行时依赖
+- 单文件运行，无额外运行时依赖，轻量级实现
 
-## 获取与运行
+## 下载
+从 [GitHub Releases](https://github.com/Cnotech/lite-command-rpc/releases) 下载最新的 Windows ZIP 压缩包
 
-从 GitHub Releases 下载最新的 Windows ZIP 压缩包，解压后运行：
+## 使用
+
+，解压后运行：
 
 ```powershell
 .\lcr.exe
 ```
 
-服务默认监听所有网络接口的 `9527` 端口：
-
-```text
-http://0.0.0.0:9527
-```
-
-通过 `--listen` 修改监听地址，例如仅允许本机访问：
+服务默认监听所有网络接口的 `9527` 端口，可通过 `--listen` 修改监听地址，例如仅允许本机访问：
 
 ```powershell
 .\lcr.exe --listen 127.0.0.1:9527
-.\lcr.exe serve --listen 127.0.0.1:9527
+.\lcr.exe --listen [::1]:9527
 ```
-
-监听地址必须使用 `IP:端口` 格式；IPv6 地址需要写成 `[::1]:9527`。
 
 默认日志等级为 `info`，客户端连接和断开等调试信息不会输出。通过 `--log-level` 调整最低输出等级：
 
