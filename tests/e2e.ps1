@@ -152,7 +152,8 @@ try {
 
     Start-E2ECase "Unicode stdout"
     $unicodeOutput = Invoke-JsonPost "/exec" @{
-        command = "echo 搜狗拼音"
+        program = $python
+        args = @("-c", "import sys; sys.stdout.buffer.write('搜狗拼音'.encode('utf-8'))")
         output_encoding = "utf8"
     }
     Assert-True $unicodeOutput.ok "Unicode command should succeed"
