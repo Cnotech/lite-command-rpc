@@ -1,7 +1,8 @@
 use crate::{
+    encoding::{decode_all, is_boundary},
     http::{send_json_error, send_response},
     logger,
-    process::{ExecRequest, run_command_observed},
+    process::{ExecRequest, OutputEncoding, run_command_observed},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -62,10 +63,11 @@ struct Session {
     error: Option<String>,
     finished_at: Option<Instant>,
     cancellation: Arc<AtomicBool>,
+    output_encoding: OutputEncoding,
 }
 
 impl Session {
-    fn new() -> Self {
+    fn new(output_encoding: OutputEncoding) -> Self {
         Self {
             pid: None,
             status: SessionStatus::Starting,
@@ -77,6 +79,7 @@ impl Session {
             error: None,
             finished_at: None,
             cancellation: Arc::new(AtomicBool::new(false)),
+            output_encoding,
         }
     }
 }
@@ -173,16 +176,14 @@ fn output_reservation(current: usize, requested: usize) -> usize {
     requested.min(MAX_TOTAL_OUTPUT_BYTES.saturating_sub(current))
 }
 
-fn result_chunk_end(output: &[u8], offset: usize) -> Option<usize> {
-    if offset > output.len()
-        || (offset < output.len() && output[offset] & 0b1100_0000 == 0b1000_0000)
-    {
+fn result_chunk_end(output: &[u8], offset: usize, encoding: OutputEncoding) -> Option<usize> {
+    if !is_boundary(output, offset, encoding) {
         return None;
     }
     let mut end = offset
         .saturating_add(MAX_RESULT_STREAM_BYTES)
         .min(output.len());
-    while end < output.len() && output[end] & 0b1100_0000 == 0b1000_0000 {
+    while end > offset && !is_boundary(output, end, encoding) {
         end -= 1;
     }
     Some(end)
@@ -241,7 +242,8 @@ pub fn handle_spawn(stream: &mut TcpStream, body: &[u8]) {
     };
 
     let session_id = next_session_id();
-    let session = Arc::new(Mutex::new(Session::new()));
+    let output_encoding = request.output_encoding();
+    let session = Arc::new(Mutex::new(Session::new(output_encoding)));
     {
         let mut registry = lock_sessions();
         cleanup_sessions(&mut registry);
@@ -397,21 +399,29 @@ fn send_session_result(
         let session = session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(stdout_end) = result_chunk_end(&session.stdout, request.stdout_offset) else {
+        let Some(stdout_end) = result_chunk_end(
+            &session.stdout,
+            request.stdout_offset,
+            session.output_encoding,
+        ) else {
             drop(session);
             send_json_error(
                 stream,
                 "400 Bad Request",
-                "stdout_offset exceeds the captured output or splits a UTF-8 character",
+                "stdout_offset exceeds the captured output or splits an encoded character",
             );
             return;
         };
-        let Some(stderr_end) = result_chunk_end(&session.stderr, request.stderr_offset) else {
+        let Some(stderr_end) = result_chunk_end(
+            &session.stderr,
+            request.stderr_offset,
+            session.output_encoding,
+        ) else {
             drop(session);
             send_json_error(
                 stream,
                 "400 Bad Request",
-                "stderr_offset exceeds the captured output or splits a UTF-8 character",
+                "stderr_offset exceeds the captured output or splits an encoded character",
             );
             return;
         };
@@ -426,10 +436,14 @@ fn send_session_result(
             stderr_offset: request.stderr_offset,
             stderr_next_offset: stderr_end,
             stderr_complete: stderr_end == session.stderr.len(),
-            stdout: String::from_utf8_lossy(&session.stdout[request.stdout_offset..stdout_end])
-                .into_owned(),
-            stderr: String::from_utf8_lossy(&session.stderr[request.stderr_offset..stderr_end])
-                .into_owned(),
+            stdout: decode_all(
+                &session.stdout[request.stdout_offset..stdout_end],
+                session.output_encoding,
+            ),
+            stderr: decode_all(
+                &session.stderr[request.stderr_offset..stderr_end],
+                session.output_encoding,
+            ),
             stdout_truncated: session.stdout_truncated,
             stderr_truncated: session.stderr_truncated,
             error: session.error.clone(),
@@ -441,8 +455,18 @@ fn send_session_result(
 }
 
 fn result_offsets_are_valid(session: &Session, request: &ResultRequest) -> bool {
-    result_chunk_end(&session.stdout, request.stdout_offset).is_some()
-        && result_chunk_end(&session.stderr, request.stderr_offset).is_some()
+    result_chunk_end(
+        &session.stdout,
+        request.stdout_offset,
+        session.output_encoding,
+    )
+    .is_some()
+        && result_chunk_end(
+            &session.stderr,
+            request.stderr_offset,
+            session.output_encoding,
+        )
+        .is_some()
 }
 
 pub fn handle_result(stream: &mut TcpStream, body: &[u8]) {
@@ -474,7 +498,7 @@ pub fn handle_terminate(stream: &mut TcpStream, body: &[u8]) {
             send_json_error(
                 stream,
                 "400 Bad Request",
-                "stdout_offset or stderr_offset exceeds the captured output or splits a UTF-8 character",
+                "stdout_offset or stderr_offset exceeds the captured output or splits an encoded character",
             );
             return;
         }
@@ -543,19 +567,22 @@ mod tests {
         let mut output = vec![b'a'; MAX_RESULT_STREAM_BYTES - 1];
         output.extend_from_slice("界".as_bytes());
         assert_eq!(
-            result_chunk_end(&output, 0),
+            result_chunk_end(&output, 0, OutputEncoding::Utf8),
             Some(MAX_RESULT_STREAM_BYTES - 1)
         );
-        assert_eq!(result_chunk_end(&output, MAX_RESULT_STREAM_BYTES), None);
         assert_eq!(
-            result_chunk_end(&output, MAX_RESULT_STREAM_BYTES - 1),
+            result_chunk_end(&output, MAX_RESULT_STREAM_BYTES, OutputEncoding::Utf8),
+            None
+        );
+        assert_eq!(
+            result_chunk_end(&output, MAX_RESULT_STREAM_BYTES - 1, OutputEncoding::Utf8,),
             Some(output.len())
         );
     }
 
     #[test]
     fn termination_validates_offsets_before_cancelling() {
-        let mut session = Session::new();
+        let mut session = Session::new(OutputEncoding::Utf8);
         session.stdout.extend_from_slice("世界".as_bytes());
         let request = ResultRequest {
             session_id: "test".to_string(),
@@ -570,9 +597,9 @@ mod tests {
     #[test]
     fn evicts_the_oldest_completed_session() {
         let mut registry = HashMap::new();
-        let mut older = Session::new();
+        let mut older = Session::new(OutputEncoding::Utf8);
         older.finished_at = Instant::now().checked_sub(Duration::from_secs(2));
-        let mut newer = Session::new();
+        let mut newer = Session::new(OutputEncoding::Utf8);
         newer.finished_at = Instant::now().checked_sub(Duration::from_secs(1));
         registry.insert("older".to_string(), Arc::new(Mutex::new(older)));
         registry.insert("newer".to_string(), Arc::new(Mutex::new(newer)));

@@ -54,9 +54,21 @@ pub enum ScriptMode {
     File,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputEncoding {
+    #[default]
+    Utf8,
+    Oem,
+    Ansi,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ExecRequest {
-    pub command: String,
+    pub command: Option<String>,
+    pub program: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
     pub cwd: Option<String>,
     pub timeout: Option<u64>,
     pub interpreter: Option<ScriptInterpreter>,
@@ -64,6 +76,8 @@ pub struct ExecRequest {
     pub script_mode: ScriptMode,
     #[serde(default)]
     pub detached: bool,
+    #[serde(default)]
+    pub output_encoding: OutputEncoding,
 }
 
 impl ExecRequest {
@@ -71,9 +85,19 @@ impl ExecRequest {
         self.timeout.unwrap_or(DEFAULT_TIMEOUT_MS)
     }
 
+    pub fn output_encoding(&self) -> OutputEncoding {
+        self.output_encoding
+    }
+
     fn use_script_file(&self) -> bool {
+        if self.program.is_some() {
+            return false;
+        }
         match self.script_mode {
-            ScriptMode::Auto => self.command.contains(['\r', '\n']),
+            ScriptMode::Auto => self
+                .command
+                .as_deref()
+                .is_some_and(|command| command.contains(['\r', '\n'])),
             ScriptMode::Inline => false,
             ScriptMode::File => true,
         }
@@ -202,6 +226,10 @@ impl ProcessJob {
     fn assign(_child: &Child, _kill_on_close: bool) -> std::io::Result<Self> {
         Ok(Self)
     }
+
+    fn active_processes(&self) -> std::io::Result<u32> {
+        Ok(0)
+    }
 }
 
 fn spawn_pipe_reader<R>(mut reader: R, stdout: bool, sender: mpsc::Sender<OutputMessage>)
@@ -210,37 +238,12 @@ where
 {
     thread::spawn(move || {
         let mut buffer = [0u8; 8192];
-        let mut pending = Vec::new();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(size) => {
-                    pending.extend_from_slice(&buffer[..size]);
-                    loop {
-                        match std::str::from_utf8(&pending) {
-                            Ok(_) => {
-                                if !send_pipe_data(&sender, stdout, std::mem::take(&mut pending)) {
-                                    return;
-                                }
-                                break;
-                            }
-                            Err(err) => {
-                                let valid_up_to = err.valid_up_to();
-                                if valid_up_to > 0 {
-                                    let valid = pending.drain(..valid_up_to).collect();
-                                    if !send_pipe_data(&sender, stdout, valid) {
-                                        return;
-                                    }
-                                }
-                                let Some(error_len) = err.error_len() else {
-                                    break;
-                                };
-                                pending.drain(..error_len);
-                                if !send_pipe_data(&sender, stdout, "�".as_bytes().to_vec()) {
-                                    return;
-                                }
-                            }
-                        }
+                    if !send_pipe_data(&sender, stdout, buffer[..size].to_vec()) {
+                        return;
                     }
                 }
                 Err(err) => {
@@ -250,15 +253,6 @@ where
                     break;
                 }
             }
-        }
-        if !pending.is_empty()
-            && !send_pipe_data(
-                &sender,
-                stdout,
-                String::from_utf8_lossy(&pending).into_owned().into_bytes(),
-            )
-        {
-            return;
         }
         let _ = sender.send(OutputMessage::Closed);
     });
@@ -381,7 +375,7 @@ fn write_script(req: &ExecRequest, file: &mut File) -> std::io::Result<()> {
         "ps1" => file.write_all(&[0xef, 0xbb, 0xbf])?,
         _ => {}
     }
-    file.write_all(req.command.as_bytes())
+    file.write_all(req.command.as_deref().unwrap_or_default().as_bytes())
 }
 
 fn configure_cmd(program: &str, script: &str) -> Command {
@@ -404,18 +398,20 @@ fn configure_pwsh(program: &str, script: &str) -> Command {
 }
 
 fn build_inline_command(req: &ExecRequest) -> Command {
+    if let Some(program) = &req.program {
+        let mut command = Command::new(program);
+        command.args(&req.args);
+        return command;
+    }
+    let script = req.command.as_deref().unwrap_or_default();
     match req.interpreter.as_ref() {
-        None | Some(ScriptInterpreter::Cmd) => configure_cmd("cmd.exe", &req.command),
-        Some(ScriptInterpreter::Pwsh) => configure_pwsh("pwsh.exe", &req.command),
-        Some(ScriptInterpreter::Absolute(path)) if is_cmd(path) => {
-            configure_cmd(path, &req.command)
-        }
-        Some(ScriptInterpreter::Absolute(path)) if is_pwsh(path) => {
-            configure_pwsh(path, &req.command)
-        }
+        None | Some(ScriptInterpreter::Cmd) => configure_cmd("cmd.exe", script),
+        Some(ScriptInterpreter::Pwsh) => configure_pwsh("pwsh.exe", script),
+        Some(ScriptInterpreter::Absolute(path)) if is_cmd(path) => configure_cmd(path, script),
+        Some(ScriptInterpreter::Absolute(path)) if is_pwsh(path) => configure_pwsh(path, script),
         Some(ScriptInterpreter::Absolute(path)) => {
             let mut command = Command::new(path);
-            command.args(["-c", &req.command]);
+            command.args(["-c", script]);
             command
         }
     }
@@ -454,6 +450,27 @@ fn build_file_command(req: &ExecRequest, path: &Path) -> Command {
 }
 
 fn prepare_command(req: &ExecRequest) -> std::io::Result<(Command, Option<TemporaryScript>)> {
+    match (&req.command, &req.program) {
+        (Some(_), Some(_)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "command and program are mutually exclusive",
+            ));
+        }
+        (None, None) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "either command or program is required",
+            ));
+        }
+        _ => {}
+    }
+    if req.program.is_some() && req.interpreter.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "interpreter cannot be used with program",
+        ));
+    }
     if !req.use_script_file() {
         return Ok((build_inline_command(req), None));
     }
@@ -655,6 +672,28 @@ mod tests {
         ));
         assert_eq!(command.get_program(), r"C:\Python313\python.exe");
         assert_eq!(args(&command), ["-c", "print('hello')"]);
+    }
+
+    #[test]
+    fn supports_direct_program_with_unicode_arguments() {
+        let req = request(
+            r#"{"program":"C:\\工具\\启动器.exe","args":["C:\\资源\\搜狗拼音.7zf","--静默"]}"#,
+        );
+        let (command, temporary) = prepare_command(&req).expect("command should be prepared");
+        assert!(temporary.is_none());
+        assert_eq!(command.get_program(), r"C:\工具\启动器.exe");
+        assert_eq!(args(&command), [r"C:\资源\搜狗拼音.7zf", "--静默"]);
+    }
+
+    #[test]
+    fn direct_program_rejects_shell_fields() {
+        for json in [
+            r#"{"command":"echo hi","program":"C:\\tool.exe"}"#,
+            r#"{"program":"C:\\tool.exe","interpreter":"cmd"}"#,
+            r#"{"args":["orphan"]}"#,
+        ] {
+            assert!(prepare_command(&request(json)).is_err());
+        }
     }
 
     #[test]

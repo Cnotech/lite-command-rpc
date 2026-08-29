@@ -83,7 +83,7 @@ $serverStdout = Join-Path $testRoot "server.stdout.log"
 $serverStderr = Join-Path $testRoot "server.stderr.log"
 $server = $null
 $failed = $false
-$script:ExpectedCaseCount = 21
+$script:ExpectedCaseCount = 24
 $script:CaseCount = 0
 $script:PassedCaseCount = 0
 $script:CurrentCase = $null
@@ -138,6 +138,40 @@ try {
         }
     }
     Assert-True $ready "lcr should listen on $listenAddress"
+    Complete-E2ECase
+
+    Start-E2ECase "Direct program execution with Unicode argument"
+    $python = (Get-Command python.exe).Source
+    $directResult = Invoke-JsonPost "/exec" @{
+        program = $python
+        args = @("-c", "import sys; print('unicode-direct-ok' if sys.argv[1] == '搜狗拼音路径' else 'unicode-direct-bad')", "搜狗拼音路径")
+    }
+    Assert-True $directResult.ok "direct Unicode program execution should succeed"
+    Assert-True ($directResult.stdout.Contains("unicode-direct-ok")) "Unicode argument should reach the program intact"
+    Complete-E2ECase
+
+    Start-E2ECase "Unicode stdout"
+    $unicodeOutput = Invoke-JsonPost "/exec" @{
+        command = "echo 搜狗拼音"
+        output_encoding = "utf8"
+    }
+    Assert-True $unicodeOutput.ok "Unicode command should succeed"
+    Assert-True ($unicodeOutput.stdout.Contains("搜狗拼音")) "Unicode stdout should be preserved"
+    Complete-E2ECase
+
+    Start-E2ECase "Output encoding validation"
+    $invalidEncodingStatus = 0
+    try {
+        Invoke-RestMethod `
+            -Method Post `
+            -Uri "$($script:BaseUri)/exec" `
+            -ContentType "application/json" `
+            -Body (@{ command = "echo hi"; output_encoding = "unknown" } | ConvertTo-Json -Compress) | Out-Null
+    }
+    catch {
+        $invalidEncodingStatus = [int]$_.Exception.Response.StatusCode
+    }
+    Assert-True ($invalidEncodingStatus -eq 400) "unknown output encoding should be rejected"
     Complete-E2ECase
 
     Start-E2ECase "Empty request without Content-Length"

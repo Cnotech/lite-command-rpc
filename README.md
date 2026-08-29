@@ -74,19 +74,22 @@ target\release\lcr.exe
 ```powershell
 curl -X POST http://127.0.0.1:9527/exec `
   -H "Content-Type: application/json" `
-  --data-raw '{"command":"tasklist","cwd":"D:\\Desktop","timeout":300000,"interpreter":"cmd","script_mode":"auto"}'
+  --data-raw '{"command":"tasklist","cwd":"D:\\Desktop","timeout":300000,"interpreter":"cmd","script_mode":"auto","output_encoding":"utf8"}'
 ```
 
 字段说明：
 
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
-| `command` | 是 | 交给所选解释器执行的脚本或命令 |
+| `command` | 二选一 | 交给所选解释器执行的脚本或命令；不能与 `program` 同时使用 |
+| `program` | 二选一 | 直接启动的程序名或 Windows 绝对路径；用于可靠传递 Unicode 路径和参数 |
+| `args` | 否 | `program` 的参数数组，默认空数组 |
 | `cwd` | 否 | 命令的工作目录 |
 | `timeout` | 否 | 超时时间，单位为毫秒，默认 300000（5 分钟） |
 | `interpreter` | 否 | 脚本解释器，默认为 `cmd`；可设为 `cmd`、`pwsh` 或解释器的 Windows 绝对路径 |
 | `script_mode` | 否 | 脚本执行方式，可设为 `auto`、`inline` 或 `file`，默认为 `auto` |
 | `detached` | 否 | 是否允许包装脚本正常退出后其子进程继续运行，默认为 `false` |
+| `output_encoding` | 否 | stdout/stderr 的编码，可设为 `utf8`、`oem` 或 `ansi`，默认为 `utf8` |
 
 解释器的调用方式如下：
 
@@ -104,6 +107,23 @@ curl -X POST http://127.0.0.1:9527/exec `
 ```
 
 相对路径不受支持。绝对路径中包含空格时无需额外添加引号。
+
+#### 直接启动程序
+
+当路径或参数包含中文等 Unicode 字符时，优先使用 `program` 和 `args`，避免经过 `cmd.exe` 的代码页和引号解析：
+
+```json
+{
+  "program": "X:\\Windows\\System32\\notepad.exe",
+  "args": ["C:\\资料\\说明.txt"]
+}
+```
+
+`program` 与 `command`、`interpreter` 互斥。参数会直接通过 Windows 宽字符进程 API 传递。
+
+#### 输出编码
+
+默认的 `utf8` 适合在 UTF-8 代码页下运行的命令。传统程序仍按系统代码页输出时，可将 `output_encoding` 指定为 `oem`（`GetOEMCP`）或 `ansi`（`GetACP`）。流式接口会保留跨数据块的多字节字符。
 
 #### 多行脚本
 

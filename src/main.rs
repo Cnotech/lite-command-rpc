@@ -1,4 +1,5 @@
 mod console;
+mod encoding;
 mod http;
 mod logger;
 mod process;
@@ -32,12 +33,15 @@ use std::{
 ///   /download     Download the file named by the JSON `path` field
 ///
 /// Execution JSON fields:
-///   command       Required script or command text
+///   command       Script or command text; mutually exclusive with program
+///   program       Executable path for direct Unicode-safe execution
+///   args          Arguments for direct program execution
 ///   cwd           Optional working directory
 ///   timeout       Timeout in milliseconds; default: 300000
 ///   interpreter   cmd, pwsh, or an absolute path; default: cmd
 ///   script_mode   auto, inline, or file; default: auto
 ///   detached      Let child processes survive after the wrapper exits; default: false
+///   output_encoding  utf8, oem, or ansi; default: utf8
 ///
 /// In auto mode, multiline commands are executed through temporary script files.
 /// Only expose this unauthenticated service on a trusted or protected network.

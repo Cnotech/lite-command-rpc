@@ -24,6 +24,7 @@ pub fn send_response(
     stream.flush()
 }
 
+#[cfg(windows)]
 pub fn send_bytes_response(
     stream: &mut TcpStream,
     status: &str,
