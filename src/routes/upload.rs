@@ -1,4 +1,5 @@
 use crate::{
+    config::RuntimePolicy,
     http::{send_json_error, send_response},
     logger,
 };
@@ -74,12 +75,20 @@ pub fn handle(
     prefetched: &[u8],
     content_length: usize,
     destination: Option<&str>,
+    policy: &RuntimePolicy,
 ) {
     let Some(destination) = destination else {
         send_json_error(stream, "400 Bad Request", "X-File-Path header is required");
         return;
     };
-    let path = Path::new(destination);
+    let path = match policy.resolve_upload(Path::new(destination)) {
+        Ok(path) => path,
+        Err(err) => {
+            send_json_error(stream, "403 Forbidden", &err);
+            return;
+        }
+    };
+    let path = path.path.as_path();
     if path.file_name().is_none() {
         send_json_error(
             stream,
@@ -173,11 +182,12 @@ pub fn handle(
     }
 
     logger::info(format_args!(
-        "uploaded: {destination} ({content_length} bytes)"
+        "uploaded: {} ({content_length} bytes)",
+        path.display()
     ));
     let body = serde_json::json!({
         "ok": true,
-        "path": destination,
+        "path": path,
         "bytes": content_length,
     })
     .to_string();

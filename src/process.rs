@@ -78,6 +78,8 @@ pub struct ExecRequest {
     pub detached: bool,
     #[serde(default)]
     pub output_encoding: OutputEncoding,
+    #[serde(skip)]
+    pub cwd_guard: Option<crate::config::PathGuard>,
 }
 
 impl ExecRequest {
@@ -341,7 +343,13 @@ impl TemporaryScript {
         let extension = script_extension(req);
         for _ in 0..100 {
             let id = SCRIPT_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let directory = req
+                .cwd
+                .as_deref()
+                .map(Path::new)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(std::env::temp_dir);
+            let path = directory.join(format!(
                 "lcr-script-{}-{id}.{extension}",
                 std::process::id()
             ));

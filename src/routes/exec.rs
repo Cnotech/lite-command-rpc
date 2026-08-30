@@ -1,4 +1,5 @@
 use crate::{
+    config::RuntimePolicy,
     encoding::{TextDecoder, decode_all},
     http::{finish_chunked_response, send_response, send_stream_event, start_chunked_response},
     logger,
@@ -16,9 +17,20 @@ struct ExecResponse {
     timed_out: bool,
     error: Option<String>,
 }
-fn parse_request(stream: &mut TcpStream, body: &[u8]) -> Option<ExecRequest> {
+fn parse_request(
+    stream: &mut TcpStream,
+    body: &[u8],
+    policy: &RuntimePolicy,
+) -> Option<ExecRequest> {
     match serde_json::from_slice(body) {
-        Ok(req) => Some(req),
+        Ok(mut req) => match policy.prepare_exec(&mut req) {
+            Ok(()) => Some(req),
+            Err(err) => {
+                let body = serde_json::json!({ "msg": err }).to_string();
+                let _ = send_response(stream, "403 Forbidden", &body, "application/json");
+                None
+            }
+        },
         Err(err) => {
             let body = serde_json::json!({ "error": format!("invalid json: {err}") }).to_string();
             let _ = send_response(stream, "400 Bad Request", &body, "application/json");
@@ -27,8 +39,8 @@ fn parse_request(stream: &mut TcpStream, body: &[u8]) -> Option<ExecRequest> {
     }
 }
 
-pub fn handle(stream: &mut TcpStream, body: &[u8]) {
-    let Some(request) = parse_request(stream, body) else {
+pub fn handle(stream: &mut TcpStream, body: &[u8], policy: &RuntimePolicy) {
+    let Some(request) = parse_request(stream, body, policy) else {
         return;
     };
     logger::info(format_args!(
@@ -96,8 +108,8 @@ pub fn handle(stream: &mut TcpStream, body: &[u8]) {
     }
 }
 
-pub fn handle_stream(stream: &mut TcpStream, body: &[u8]) {
-    let Some(request) = parse_request(stream, body) else {
+pub fn handle_stream(stream: &mut TcpStream, body: &[u8], policy: &RuntimePolicy) {
+    let Some(request) = parse_request(stream, body, policy) else {
         return;
     };
     logger::info(format_args!(

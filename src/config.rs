@@ -1,0 +1,611 @@
+use crate::process::{ExecRequest, ScriptInterpreter};
+use regex::{Regex, RegexBuilder};
+use serde::Deserialize;
+use std::{
+    fs::{self, File},
+    path::{Component, Path, PathBuf},
+};
+
+#[derive(Debug, Default)]
+pub(crate) struct PathGuard {
+    #[cfg(windows)]
+    _handles: Vec<File>,
+}
+
+#[derive(Debug)]
+pub struct GuardedPath {
+    pub path: PathBuf,
+    _guard: PathGuard,
+}
+
+#[derive(Debug)]
+pub struct GuardedDownload {
+    pub path: PathBuf,
+    pub file: File,
+    _guard: PathGuard,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    work_dir: Option<WorkDirConfig>,
+    #[serde(default)]
+    command_allowlist: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WorkDirConfig {
+    One(PathBuf),
+    Many(Vec<PathBuf>),
+}
+
+#[derive(Debug)]
+enum CommandRule {
+    Prefix(String),
+    Regex(Regex),
+}
+
+#[derive(Debug, Default)]
+pub struct RuntimePolicy {
+    work_dirs: Vec<PathBuf>,
+    default_work_dir: Option<PathBuf>,
+    command_allowlist: Vec<CommandRule>,
+}
+
+impl RuntimePolicy {
+    pub fn load(path: Option<&Path>) -> Result<(Self, Option<PathBuf>), String> {
+        let (path, required) = match path {
+            Some(path) => (path.to_path_buf(), true),
+            None => {
+                let exe = std::env::current_exe()
+                    .map_err(|err| format!("failed to locate lcr.exe: {err}"))?;
+                (exe.with_file_name("lcr.toml"), false)
+            }
+        };
+        if !path.exists() && !required {
+            return Ok((Self::default(), None));
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|err| format!("failed to read config {}: {err}", path.display()))?;
+        let config: FileConfig = toml::from_str(&text)
+            .map_err(|err| format!("invalid config {}: {err}", path.display()))?;
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        let (work_dirs, has_default) = match config.work_dir {
+            None => (Vec::new(), false),
+            Some(WorkDirConfig::One(value)) => (vec![value], true),
+            Some(WorkDirConfig::Many(values)) if values.is_empty() => {
+                return Err("work_dir array cannot be empty".to_string());
+            }
+            Some(WorkDirConfig::Many(values)) => (values, false),
+        };
+        let work_dirs = work_dirs
+            .into_iter()
+            .map(|value| {
+                let value = if value.is_absolute() {
+                    value
+                } else {
+                    base.join(value)
+                };
+                let resolved = fs::canonicalize(&value)
+                    .map_err(|err| format!("invalid work_dir {}: {err}", value.display()))?;
+                if !resolved.is_dir() {
+                    return Err(format!(
+                        "work_dir must be an existing directory: {}",
+                        value.display()
+                    ));
+                }
+                Ok(resolved)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let default_work_dir = has_default.then(|| work_dirs[0].clone());
+
+        let command_allowlist = config
+            .command_allowlist
+            .into_iter()
+            .map(parse_command_rule)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
+            Self {
+                work_dirs,
+                default_work_dir,
+                command_allowlist,
+            },
+            Some(path),
+        ))
+    }
+
+    pub fn prepare_exec(&self, request: &mut ExecRequest) -> Result<(), String> {
+        if !self.command_allowlist.is_empty() {
+            if matches!(request.interpreter, Some(ScriptInterpreter::Absolute(_))) {
+                return Err(
+                    "custom absolute interpreters are not allowed when command_allowlist is configured"
+                        .to_string(),
+                );
+            }
+            let candidate = command_candidate(request)
+                .ok_or_else(|| "either command or program is required".to_string())?;
+            if !self
+                .command_allowlist
+                .iter()
+                .any(|rule| rule.matches(&candidate))
+            {
+                return Err("command is not allowed by command_allowlist".to_string());
+            }
+        }
+        if self.work_dirs.is_empty() {
+            return Ok(());
+        }
+        let cwd = match request.cwd.as_deref() {
+            Some(cwd) => self.resolve_existing(Path::new(cwd))?,
+            None => {
+                let path = self.default_work_dir.clone().ok_or_else(|| {
+                    "cwd is required when work_dir is configured as an array".to_string()
+                })?;
+                self.guard_existing(path)?
+            }
+        };
+        if !cwd.path.is_dir() {
+            return Err("cwd must be an existing directory".to_string());
+        }
+        request.cwd = Some(cwd.path.to_string_lossy().into_owned());
+        request.cwd_guard = Some(cwd._guard);
+        Ok(())
+    }
+
+    pub fn resolve_download(&self, path: &Path) -> Result<GuardedDownload, String> {
+        if self.work_dirs.is_empty() {
+            let file = File::open(path)
+                .map_err(|err| format!("failed to open download {}: {err}", path.display()))?;
+            Ok(GuardedDownload {
+                path: path.to_path_buf(),
+                file,
+                _guard: PathGuard::default(),
+            })
+        } else {
+            let guarded = self.resolve_existing(path)?;
+            let file = open_file_without_delete_sharing(&guarded.path).map_err(|err| {
+                format!("failed to open download {}: {err}", guarded.path.display())
+            })?;
+            let actual = opened_file_path(&file, &guarded.path)?;
+            self.ensure_within_root(&actual)?;
+            Ok(GuardedDownload {
+                path: actual,
+                file,
+                _guard: guarded._guard,
+            })
+        }
+    }
+
+    pub fn resolve_upload(&self, path: &Path) -> Result<GuardedPath, String> {
+        if self.work_dirs.is_empty() {
+            return Ok(GuardedPath {
+                path: path.to_path_buf(),
+                _guard: PathGuard::default(),
+            });
+        }
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.default_work_dir
+                .as_ref()
+                .ok_or_else(relative_path_with_multiple_roots)?
+                .join(path)
+        };
+        let file_name = joined
+            .file_name()
+            .ok_or_else(|| "destination must include a file name".to_string())?;
+        let parent = joined.parent().unwrap_or_else(|| Path::new("."));
+        let parent = fs::canonicalize(parent)
+            .map_err(|err| format!("destination directory does not exist: {err}"))?;
+        self.ensure_within_root(&parent)?;
+        let parent = self.guard_existing(parent)?;
+        Ok(GuardedPath {
+            path: parent.path.join(file_name),
+            _guard: parent._guard,
+        })
+    }
+
+    fn resolve_existing(&self, path: &Path) -> Result<GuardedPath, String> {
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.default_work_dir
+                .as_ref()
+                .ok_or_else(relative_path_with_multiple_roots)?
+                .join(path)
+        };
+        let resolved = fs::canonicalize(&joined)
+            .map_err(|err| format!("path does not exist: {}: {err}", joined.display()))?;
+        self.ensure_within_root(&resolved)?;
+        self.guard_existing(resolved)
+    }
+
+    fn guard_existing(&self, path: PathBuf) -> Result<GuardedPath, String> {
+        let guard = PathGuard::lock(&path)
+            .map_err(|err| format!("failed to lock path {}: {err}", path.display()))?;
+        let resolved = fs::canonicalize(&path)
+            .map_err(|err| format!("path changed during validation: {}: {err}", path.display()))?;
+        self.ensure_within_root(&resolved)?;
+        Ok(GuardedPath {
+            path: resolved,
+            _guard: guard,
+        })
+    }
+
+    fn ensure_within_root(&self, path: &Path) -> Result<(), String> {
+        if self
+            .work_dirs
+            .iter()
+            .any(|root| path_starts_with(path, root))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "path is outside configured work_dir: {}",
+                path.display()
+            ))
+        }
+    }
+}
+
+impl PathGuard {
+    #[cfg(windows)]
+    fn lock(path: &Path) -> std::io::Result<Self> {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, GetFileInformationByHandle,
+        };
+
+        let mut handles = Vec::new();
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            current.push(component.as_os_str());
+            if !matches!(component, Component::RootDir | Component::Normal(_)) {
+                continue;
+            }
+            let handle = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&current)?;
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { GetFileInformationByHandle(handle.as_raw_handle() as _, &mut info) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("reparse points are not allowed: {}", current.display()),
+                ));
+            }
+            handles.push(handle);
+        }
+        Ok(Self { _handles: handles })
+    }
+
+    #[cfg(not(windows))]
+    fn lock(_path: &Path) -> std::io::Result<Self> {
+        Ok(Self::default())
+    }
+}
+
+#[cfg(windows)]
+fn open_file_without_delete_sharing(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_file_without_delete_sharing(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(windows)]
+fn opened_file_path(file: &File, _requested: &Path) -> Result<PathBuf, String> {
+    use std::{
+        ffi::OsString,
+        os::windows::{ffi::OsStringExt, io::AsRawHandle},
+    };
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    let handle = file.as_raw_handle() as _;
+    let required = unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, 0) };
+    if required == 0 {
+        return Err(format!(
+            "failed to resolve opened download: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut buffer = vec![0u16; required as usize + 1];
+    let written =
+        unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err(format!(
+            "failed to resolve opened download: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(PathBuf::from(OsString::from_wide(
+        &buffer[..written as usize],
+    )))
+}
+
+#[cfg(not(windows))]
+fn opened_file_path(file: &File, requested: &Path) -> Result<PathBuf, String> {
+    let _ = file;
+    fs::canonicalize(requested).map_err(|err| format!("failed to resolve opened download: {err}"))
+}
+
+#[cfg(windows)]
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+    let mut path_components = path.components();
+    root.components().all(|root_component| {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+        let left = path_component.as_os_str().encode_wide().collect::<Vec<_>>();
+        let right = root_component.as_os_str().encode_wide().collect::<Vec<_>>();
+        (unsafe {
+            CompareStringOrdinal(
+                left.as_ptr(),
+                left.len() as i32,
+                right.as_ptr(),
+                right.len() as i32,
+                1,
+            )
+        }) == CSTR_EQUAL
+    })
+}
+
+#[cfg(not(windows))]
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+}
+
+fn relative_path_with_multiple_roots() -> String {
+    "relative paths are not allowed when work_dir is an array; use an absolute path".to_string()
+}
+
+fn command_candidate(request: &ExecRequest) -> Option<String> {
+    if let Some(command) = &request.command {
+        return Some(command.clone());
+    }
+    let program = request.program.as_ref()?;
+    let mut candidate = program.clone();
+    for argument in &request.args {
+        candidate.push(' ');
+        candidate
+            .push_str(&serde_json::to_string(argument).expect("serializing a string cannot fail"));
+    }
+    Some(candidate)
+}
+
+impl CommandRule {
+    fn matches(&self, command: &str) -> bool {
+        match self {
+            Self::Prefix(prefix) => command.to_lowercase().starts_with(&prefix.to_lowercase()),
+            Self::Regex(regex) => regex.is_match(command),
+        }
+    }
+}
+
+fn parse_command_rule(value: String) -> Result<CommandRule, String> {
+    if value.len() >= 2 && value.starts_with('/') && value.ends_with('/') {
+        let pattern = &value[1..value.len() - 1];
+        if pattern.is_empty() {
+            return Err("command_allowlist regex cannot be empty".to_string());
+        }
+        return RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .map(CommandRule::Regex)
+            .map_err(|err| format!("invalid command_allowlist regex {value:?}: {err}"));
+    }
+    if value.is_empty() {
+        return Err("command_allowlist prefix cannot be empty".to_string());
+    }
+    Ok(CommandRule::Prefix(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowlist_prefix_and_regex_are_case_insensitive() {
+        let prefix = parse_command_rule("echo ".to_string()).unwrap();
+        let regex = parse_command_rule("/^git (status|diff)$/".to_string()).unwrap();
+        assert!(prefix.matches("ECHO hello"));
+        assert!(!prefix.matches("xecho hello"));
+        assert!(regex.matches("GIT STATUS"));
+        assert!(!regex.matches("git push"));
+    }
+
+    #[test]
+    fn configured_paths_cannot_escape_the_root() {
+        let root = fs::canonicalize(".").unwrap();
+        let policy = RuntimePolicy {
+            work_dirs: vec![root.clone()],
+            default_work_dir: Some(root.clone()),
+            command_allowlist: Vec::new(),
+        };
+        assert_eq!(policy.resolve_existing(Path::new(".")).unwrap().path, root);
+        let outside = root.parent().unwrap();
+        assert!(policy.resolve_existing(outside).is_err());
+    }
+
+    #[test]
+    fn relative_paths_are_resolved_from_the_root() {
+        let root = std::env::temp_dir().join(format!(
+            "lcr-config-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("file.bin");
+        fs::write(&file, b"test").unwrap();
+        let policy = RuntimePolicy {
+            work_dirs: vec![fs::canonicalize(&root).unwrap()],
+            default_work_dir: Some(fs::canonicalize(&root).unwrap()),
+            command_allowlist: Vec::new(),
+        };
+        assert_eq!(
+            policy
+                .resolve_download(Path::new("nested/file.bin"))
+                .unwrap()
+                .path,
+            fs::canonicalize(&file).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loads_an_explicit_config_and_resolves_its_relative_work_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "lcr-config-load-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work_dir = root.join("workspace");
+        fs::create_dir_all(&work_dir).unwrap();
+        let config_path = root.join("custom.toml");
+        fs::write(
+            &config_path,
+            "work_dir = 'workspace'\ncommand_allowlist = ['echo ', '/^cd$/']\n",
+        )
+        .unwrap();
+
+        let (policy, loaded_path) = RuntimePolicy::load(Some(&config_path)).unwrap();
+        assert_eq!(loaded_path, Some(config_path));
+        assert_eq!(policy.work_dirs, vec![fs::canonicalize(&work_dir).unwrap()]);
+        assert_eq!(
+            policy.default_work_dir,
+            Some(fs::canonicalize(work_dir).unwrap())
+        );
+        assert_eq!(policy.command_allowlist.len(), 2);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_an_invalid_allowlist_regex() {
+        let error = parse_command_rule("/[unterminated/".to_string()).unwrap_err();
+        assert!(error.contains("invalid command_allowlist regex"));
+    }
+
+    #[test]
+    fn work_dir_array_requires_cwd_and_accepts_each_root() {
+        let root = fs::canonicalize(".").unwrap();
+        let other = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let policy = RuntimePolicy {
+            work_dirs: vec![root.clone(), other.clone()],
+            default_work_dir: None,
+            command_allowlist: Vec::new(),
+        };
+        let mut missing = serde_json::from_str::<ExecRequest>(r#"{"command":"echo hi"}"#).unwrap();
+        assert_eq!(
+            policy.prepare_exec(&mut missing).unwrap_err(),
+            "cwd is required when work_dir is configured as an array"
+        );
+        let mut explicit = serde_json::from_value::<ExecRequest>(serde_json::json!({
+            "command": "echo hi",
+            "cwd": other,
+        }))
+        .unwrap();
+        policy.prepare_exec(&mut explicit).unwrap();
+        assert_eq!(explicit.cwd, Some(other.to_string_lossy().into_owned()));
+        assert!(policy.resolve_download(Path::new("relative.bin")).is_err());
+    }
+
+    #[test]
+    fn loads_a_work_dir_array_without_a_default() {
+        let config: FileConfig = toml::from_str("work_dir = ['one', 'two']").unwrap();
+        assert!(matches!(config.work_dir, Some(WorkDirConfig::Many(values)) if values.len() == 2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn work_dir_boundary_comparison_is_case_insensitive_on_windows() {
+        assert!(path_starts_with(
+            Path::new(r"C:\WORKSPACE\Child"),
+            Path::new(r"c:\workspace")
+        ));
+        assert!(!path_starts_with(
+            Path::new(r"C:\WORKSPACE-other"),
+            Path::new(r"c:\workspace")
+        ));
+    }
+
+    #[test]
+    fn direct_program_allowlist_candidate_includes_quoted_arguments() {
+        let request = serde_json::from_value::<ExecRequest>(serde_json::json!({
+            "program": "git.exe",
+            "args": ["status", "path with spaces", "quote\"value"]
+        }))
+        .unwrap();
+        assert_eq!(
+            command_candidate(&request).unwrap(),
+            r#"git.exe "status" "path with spaces" "quote\"value""#
+        );
+    }
+
+    #[test]
+    fn direct_program_arguments_participate_in_allowlist_matching() {
+        let policy = RuntimePolicy {
+            work_dirs: Vec::new(),
+            default_work_dir: None,
+            command_allowlist: vec![
+                parse_command_rule(r#"/^git\.exe "status"$/"#.to_string()).unwrap(),
+            ],
+        };
+        let mut allowed = serde_json::from_value::<ExecRequest>(serde_json::json!({
+            "program": "git.exe",
+            "args": ["status"]
+        }))
+        .unwrap();
+        policy.prepare_exec(&mut allowed).unwrap();
+        let mut blocked = serde_json::from_value::<ExecRequest>(serde_json::json!({
+            "program": "git.exe",
+            "args": ["push"]
+        }))
+        .unwrap();
+        assert_eq!(
+            policy.prepare_exec(&mut blocked).unwrap_err(),
+            "command is not allowed by command_allowlist"
+        );
+    }
+
+    #[test]
+    fn allowlist_rejects_custom_absolute_interpreters() {
+        let policy = RuntimePolicy {
+            work_dirs: Vec::new(),
+            default_work_dir: None,
+            command_allowlist: vec![parse_command_rule("echo ".to_string()).unwrap()],
+        };
+        let mut request = serde_json::from_value::<ExecRequest>(serde_json::json!({
+            "command": "echo allowed text",
+            "interpreter": "C:\\tools\\custom.exe"
+        }))
+        .unwrap();
+        assert_eq!(
+            policy.prepare_exec(&mut request).unwrap_err(),
+            "custom absolute interpreters are not allowed when command_allowlist is configured"
+        );
+    }
+}

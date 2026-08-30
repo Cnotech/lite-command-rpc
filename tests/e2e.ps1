@@ -82,8 +82,10 @@ $testRoot = Join-Path $env:RUNNER_TEMP ("lcr-e2e-" + [guid]::NewGuid().ToString(
 $serverStdout = Join-Path $testRoot "server.stdout.log"
 $serverStderr = Join-Path $testRoot "server.stderr.log"
 $server = $null
+$configServer = $null
+$arrayConfigServer = $null
 $failed = $false
-$script:ExpectedCaseCount = 24
+$script:ExpectedCaseCount = 26
 $script:CaseCount = 0
 $script:PassedCaseCount = 0
 $script:CurrentCase = $null
@@ -626,6 +628,236 @@ try {
         "streaming execution should log its timeout status"
     Complete-E2ECase
 
+    Start-E2ECase "Config work directory and command allowlist"
+    $configPort = Get-FreeTcpPort
+    $configAddress = "${listenHost}:$configPort"
+    $configRoot = Join-Path $testRoot "config-root"
+    $configFile = Join-Path $testRoot "lcr.test.toml"
+    $configStdout = Join-Path $testRoot "config-server.stdout.log"
+    $configStderr = Join-Path $testRoot "config-server.stderr.log"
+    New-Item -ItemType Directory -Path $configRoot | Out-Null
+    @"
+work_dir = '$configRoot'
+command_allowlist = ['echo ', '/^cd$/']
+"@ | Set-Content -LiteralPath $configFile -Encoding utf8
+    $configServer = Start-Process `
+        -FilePath $binary `
+        -ArgumentList @("serve", "--listen", $configAddress, "--config", $configFile) `
+        -PassThru `
+        -RedirectStandardOutput $configStdout `
+        -RedirectStandardError $configStderr
+    $configBaseUri = "http://$configAddress"
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+        try {
+            $configCwd = Invoke-RestMethod -Method Post -Uri "$configBaseUri/exec" `
+                -ContentType "application/json" -Body '{"command":"cd"}'
+            break
+        }
+        catch {
+            if ($configServer.HasExited) { throw "configured lcr exited before becoming ready" }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    Assert-True $configCwd.ok "configured command should run"
+    Assert-True `
+        ([string]::Equals($configCwd.stdout.Trim(), $configRoot, [System.StringComparison]::OrdinalIgnoreCase)) `
+        "omitted cwd should default to work_dir"
+    $configEcho = Invoke-RestMethod -Method Post -Uri "$configBaseUri/exec" `
+        -ContentType "application/json" -Body '{"command":"ECHO config-ok"}'
+    Assert-True ($configEcho.stdout.Contains("config-ok")) "prefix matching should ignore case"
+    foreach ($blockedEndpoint in @("/exec", "/exec/stream", "/spawn")) {
+        $blockedStatus = 0
+        $blockedMsg = $null
+        try {
+            Invoke-RestMethod -Method Post -Uri "$configBaseUri$blockedEndpoint" `
+                -ContentType "application/json" -Body '{"command":"whoami"}' | Out-Null
+        }
+        catch {
+            $blockedStatus = [int]$_.Exception.Response.StatusCode
+            if (-not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+                $blockedMsg = ($_.ErrorDetails.Message | ConvertFrom-Json).msg
+            }
+        }
+        Assert-True ($blockedStatus -eq 403) "$blockedEndpoint should reject blocked commands"
+        Assert-True `
+            ($blockedMsg -eq "command is not allowed by command_allowlist") `
+            "$blockedEndpoint should explain command rejection in msg"
+    }
+    $customInterpreterStatus = 0
+    $customInterpreterMsg = $null
+    try {
+        Invoke-RestMethod -Method Post -Uri "$configBaseUri/exec" `
+            -ContentType "application/json" `
+            -Body (@{ command = "echo allowed text"; interpreter = $python } | ConvertTo-Json -Compress) | Out-Null
+    }
+    catch {
+        $customInterpreterStatus = [int]$_.Exception.Response.StatusCode
+        if (-not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+            $customInterpreterMsg = ($_.ErrorDetails.Message | ConvertFrom-Json).msg
+        }
+    }
+    Assert-True ($customInterpreterStatus -eq 403) "custom interpreters should not bypass allowlists"
+    Assert-True `
+        ($customInterpreterMsg -eq "custom absolute interpreters are not allowed when command_allowlist is configured") `
+        "custom interpreter rejection should explain the reason in msg"
+    $outsideStatus = 0
+    try {
+        Invoke-RestMethod -Method Post -Uri "$configBaseUri/download" `
+            -ContentType "application/json" `
+            -Body (@{ path = $binary } | ConvertTo-Json -Compress) | Out-Null
+    }
+    catch { $outsideStatus = [int]$_.Exception.Response.StatusCode }
+    Assert-True ($outsideStatus -eq 403) "downloads outside work_dir should be rejected"
+    $configSource = Join-Path $testRoot "config-source.bin"
+    $configDownload = Join-Path $testRoot "config-download.bin"
+    [System.IO.File]::WriteAllBytes($configSource, [byte[]](10, 20, 30, 40))
+    $relativeUpload = Invoke-RestMethod -Method Post -Uri "$configBaseUri/upload" `
+        -ContentType "application/octet-stream" -Headers @{ "X-File-Path" = "relative.bin" } `
+        -InFile $configSource
+    Assert-True $relativeUpload.ok "relative uploads should resolve within work_dir"
+    Invoke-WebRequest -Method Post -Uri "$configBaseUri/download" `
+        -ContentType "application/json" -Body '{"path":"relative.bin"}' `
+        -OutFile $configDownload
+    Assert-True `
+        ((Get-FileHash $configSource).Hash -eq (Get-FileHash $configDownload).Hash) `
+        "relative downloads should resolve within work_dir"
+    $outsideUploadStatus = 0
+    try {
+        Invoke-RestMethod -Method Post -Uri "$configBaseUri/upload" `
+            -ContentType "application/octet-stream" -Headers @{ "X-File-Path" = $configSource } `
+            -InFile $configSource | Out-Null
+    }
+    catch { $outsideUploadStatus = [int]$_.Exception.Response.StatusCode }
+    Assert-True ($outsideUploadStatus -eq 403) "uploads outside work_dir should be rejected"
+    Complete-E2ECase
+
+    Start-E2ECase "Multiple configured work directories"
+    $arrayConfigPort = Get-FreeTcpPort
+    $arrayConfigAddress = "${listenHost}:$arrayConfigPort"
+    $arrayRootA = Join-Path $testRoot "array-root-a"
+    $arrayRootB = Join-Path $testRoot "array-root-b"
+    $arrayConfigFile = Join-Path $testRoot "lcr.array.toml"
+    $arrayConfigStdout = Join-Path $testRoot "array-config-server.stdout.log"
+    $arrayConfigStderr = Join-Path $testRoot "array-config-server.stderr.log"
+    New-Item -ItemType Directory -Path $arrayRootA | Out-Null
+    New-Item -ItemType Directory -Path $arrayRootB | Out-Null
+    @"
+work_dir = ['$arrayRootA', '$arrayRootB']
+command_allowlist = ['echo ', '/^cd$/']
+"@ | Set-Content -LiteralPath $arrayConfigFile -Encoding utf8
+    $arrayConfigServer = Start-Process `
+        -FilePath $binary `
+        -ArgumentList @("serve", "--listen", $arrayConfigAddress, "--config", $arrayConfigFile) `
+        -PassThru `
+        -RedirectStandardOutput $arrayConfigStdout `
+        -RedirectStandardError $arrayConfigStderr
+    $arrayConfigBaseUri = "http://$arrayConfigAddress"
+    $missingCwdStatus = 0
+    $missingCwdMsg = $null
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+        try {
+            Invoke-RestMethod -Method Post -Uri "$arrayConfigBaseUri/exec" `
+                -ContentType "application/json" -Body '{"command":"cd"}' | Out-Null
+        }
+        catch {
+            if ($null -ne $_.Exception.Response) {
+                $missingCwdStatus = [int]$_.Exception.Response.StatusCode
+                if (-not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+                    $missingCwdMsg = ($_.ErrorDetails.Message | ConvertFrom-Json).msg
+                }
+                break
+            }
+        }
+        if ($arrayConfigServer.HasExited) { throw "array-configured lcr exited before becoming ready" }
+        Start-Sleep -Milliseconds 100
+    }
+    Assert-True ($missingCwdStatus -eq 403) "work_dir arrays should require cwd"
+    Assert-True `
+        ($missingCwdMsg -eq "cwd is required when work_dir is configured as an array") `
+        "missing cwd rejection should explain the reason in msg"
+    foreach ($cwdEndpoint in @("/exec/stream", "/spawn")) {
+        $endpointStatus = 0
+        $endpointMsg = $null
+        try {
+            Invoke-RestMethod -Method Post -Uri "$arrayConfigBaseUri$cwdEndpoint" `
+                -ContentType "application/json" -Body '{"command":"cd"}' | Out-Null
+        }
+        catch {
+            $endpointStatus = [int]$_.Exception.Response.StatusCode
+            if (-not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+                $endpointMsg = ($_.ErrorDetails.Message | ConvertFrom-Json).msg
+            }
+        }
+        Assert-True ($endpointStatus -eq 403) "$cwdEndpoint should require cwd for work_dir arrays"
+        Assert-True `
+            ($endpointMsg -eq "cwd is required when work_dir is configured as an array") `
+            "$cwdEndpoint should explain the missing cwd in msg"
+    }
+    $arrayCwdResult = Invoke-RestMethod -Method Post -Uri "$arrayConfigBaseUri/exec" `
+        -ContentType "application/json" `
+        -Body (@{ command = "cd"; cwd = $arrayRootB } | ConvertTo-Json -Compress)
+    Assert-True $arrayCwdResult.ok "an explicitly selected array work_dir should be allowed"
+    Assert-True `
+        ([string]::Equals($arrayCwdResult.stdout.Trim(), $arrayRootB, [System.StringComparison]::OrdinalIgnoreCase)) `
+        "the command should run in the selected array work_dir"
+    foreach ($cwdEndpoint in @("/exec", "/exec/stream", "/spawn")) {
+        $outsideCwdStatus = 0
+        $outsideCwdMsg = $null
+        try {
+            Invoke-RestMethod -Method Post -Uri "$arrayConfigBaseUri$cwdEndpoint" `
+                -ContentType "application/json" `
+                -Body (@{ command = "echo outside"; cwd = $testRoot } | ConvertTo-Json -Compress) | Out-Null
+        }
+        catch {
+            $outsideCwdStatus = [int]$_.Exception.Response.StatusCode
+            if (-not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+                $outsideCwdMsg = ($_.ErrorDetails.Message | ConvertFrom-Json).msg
+            }
+        }
+        Assert-True ($outsideCwdStatus -eq 403) "$cwdEndpoint should reject cwd outside all roots"
+        Assert-True `
+            ([string]$outsideCwdMsg).Contains("outside configured work_dir") `
+            "$cwdEndpoint should explain the cwd boundary violation in msg"
+    }
+    $arraySource = Join-Path $testRoot "array-source.bin"
+    $arrayRootAFile = Join-Path $arrayRootA "from-a.bin"
+    $arrayRootBFile = Join-Path $arrayRootB "to-b.bin"
+    $arrayDownloaded = Join-Path $testRoot "array-downloaded.bin"
+    [System.IO.File]::WriteAllBytes($arraySource, [byte[]](50, 60, 70, 80))
+    Copy-Item -LiteralPath $arraySource -Destination $arrayRootAFile
+    Invoke-WebRequest -Method Post -Uri "$arrayConfigBaseUri/download" `
+        -ContentType "application/json" `
+        -Body (@{ path = $arrayRootAFile } | ConvertTo-Json -Compress) `
+        -OutFile $arrayDownloaded
+    Assert-True `
+        ((Get-FileHash $arraySource).Hash -eq (Get-FileHash $arrayDownloaded).Hash) `
+        "absolute downloads from any configured root should succeed"
+    $arrayUpload = Invoke-RestMethod -Method Post -Uri "$arrayConfigBaseUri/upload" `
+        -ContentType "application/octet-stream" -Headers @{ "X-File-Path" = $arrayRootBFile } `
+        -InFile $arraySource
+    Assert-True $arrayUpload.ok "absolute uploads to any configured root should succeed"
+    $relativeArrayDownloadStatus = 0
+    try {
+        Invoke-RestMethod -Method Post -Uri "$arrayConfigBaseUri/download" `
+            -ContentType "application/json" -Body '{"path":"relative.bin"}' | Out-Null
+    }
+    catch { $relativeArrayDownloadStatus = [int]$_.Exception.Response.StatusCode }
+    Assert-True `
+        ($relativeArrayDownloadStatus -eq 403) `
+        "relative file paths should be rejected when work_dir is an array"
+    $outsideArrayUpload = Join-Path $testRoot "outside-array-upload.bin"
+    $outsideArrayUploadStatus = 0
+    try {
+        Invoke-RestMethod -Method Post -Uri "$arrayConfigBaseUri/upload" `
+            -ContentType "application/octet-stream" `
+            -Headers @{ "X-File-Path" = $outsideArrayUpload } -InFile $arraySource | Out-Null
+    }
+    catch { $outsideArrayUploadStatus = [int]$_.Exception.Response.StatusCode }
+    Assert-True `
+        ($outsideArrayUploadStatus -eq 403) `
+        "uploads outside every configured root should be rejected"
+    Complete-E2ECase
+
     $totalTimer.Stop()
     Assert-True `
         ($script:CaseCount -eq $script:ExpectedCaseCount) `
@@ -661,6 +893,14 @@ finally {
     if ($null -ne $server -and -not $server.HasExited) {
         Stop-Process -Id $server.Id -Force
         Wait-Process -Id $server.Id -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $configServer -and -not $configServer.HasExited) {
+        Stop-Process -Id $configServer.Id -Force
+        Wait-Process -Id $configServer.Id -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $arrayConfigServer -and -not $arrayConfigServer.HasExited) {
+        Stop-Process -Id $arrayConfigServer.Id -Force
+        Wait-Process -Id $arrayConfigServer.Id -ErrorAction SilentlyContinue
     }
     if ($failed) {
         if (Test-Path $serverStdout) {

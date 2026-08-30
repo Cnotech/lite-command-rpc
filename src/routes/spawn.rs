@@ -1,4 +1,5 @@
 use crate::{
+    config::RuntimePolicy,
     encoding::{decode_all, is_boundary},
     http::{send_json_error, send_response},
     logger,
@@ -232,14 +233,19 @@ fn next_session_id() -> String {
     )
 }
 
-pub fn handle_spawn(stream: &mut TcpStream, body: &[u8]) {
-    let request: ExecRequest = match serde_json::from_slice(body) {
+pub fn handle_spawn(stream: &mut TcpStream, body: &[u8], policy: &RuntimePolicy) {
+    let mut request: ExecRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
             send_json_error(stream, "400 Bad Request", &format!("invalid json: {err}"));
             return;
         }
     };
+    if let Err(err) = policy.prepare_exec(&mut request) {
+        let body = serde_json::json!({ "msg": err }).to_string();
+        let _ = send_response(stream, "403 Forbidden", &body, "application/json");
+        return;
+    }
 
     let session_id = next_session_id();
     let output_encoding = request.output_encoding();

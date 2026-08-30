@@ -1,3 +1,4 @@
+mod config;
 mod console;
 mod encoding;
 mod http;
@@ -7,11 +8,14 @@ mod routes;
 
 use crate::http::{MAX_JSON_BODY_SIZE, read_body, send_json_error};
 use clap::{Parser, Subcommand};
+use config::RuntimePolicy;
 use std::{
     collections::HashMap,
     io::Read,
     net::{SocketAddr, TcpListener, TcpStream},
+    path::PathBuf,
     process::ExitCode,
+    sync::Arc,
     thread,
 };
 
@@ -48,6 +52,10 @@ use std::{
 #[derive(Debug, Parser)]
 #[command(name = "lcr", version, verbatim_doc_comment)]
 struct Cli {
+    /// TOML config path; defaults to lcr.toml next to lcr.exe when present
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
     /// Address and port on which the HTTP service listens
     #[arg(
         long,
@@ -126,7 +134,13 @@ fn parse_request_head(data: &[u8]) -> Result<RequestHead, String> {
     })
 }
 
-fn handle_json_route(stream: &mut TcpStream, path: &str, prefetched: &[u8], content_length: usize) {
+fn handle_json_route(
+    stream: &mut TcpStream,
+    path: &str,
+    prefetched: &[u8],
+    content_length: usize,
+    policy: &RuntimePolicy,
+) {
     if content_length > MAX_JSON_BODY_SIZE {
         send_json_error(stream, "413 Payload Too Large", "request body too large");
         return;
@@ -144,9 +158,9 @@ fn handle_json_route(stream: &mut TcpStream, path: &str, prefetched: &[u8], cont
     };
 
     match path {
-        "/exec" => routes::exec::handle(stream, &body),
-        "/exec/stream" => routes::exec::handle_stream(stream, &body),
-        "/spawn" => routes::spawn::handle_spawn(stream, &body),
+        "/exec" => routes::exec::handle(stream, &body, policy),
+        "/exec/stream" => routes::exec::handle_stream(stream, &body, policy),
+        "/spawn" => routes::spawn::handle_spawn(stream, &body, policy),
         "/spawn/result" => routes::spawn::handle_result(stream, &body),
         "/spawn/terminate" => routes::spawn::handle_terminate(stream, &body),
         #[cfg(windows)]
@@ -155,12 +169,12 @@ fn handle_json_route(stream: &mut TcpStream, path: &str, prefetched: &[u8], cont
         "/windows" => routes::windows::handle(stream),
         #[cfg(windows)]
         "/control" => routes::control::handle(stream, &body),
-        "/download" => routes::download::handle(stream, &body),
+        "/download" => routes::download::handle(stream, &body, policy),
         _ => send_json_error(stream, "404 Not Found", "not found"),
     }
 }
 
-fn handle_client(mut stream: TcpStream) {
+fn handle_client(mut stream: TcpStream, policy: &RuntimePolicy) {
     let peer = stream.peer_addr().ok();
     logger::debug(format_args!("client connected: {peer:?}"));
     let mut buffer = Vec::new();
@@ -213,20 +227,28 @@ fn handle_client(mut stream: TcpStream) {
             prefetched,
             head.content_length,
             head.headers.get("x-file-path").map(String::as_str),
+            policy,
         );
     } else {
-        handle_json_route(&mut stream, &head.path, prefetched, head.content_length);
+        handle_json_route(
+            &mut stream,
+            &head.path,
+            prefetched,
+            head.content_length,
+            policy,
+        );
     }
     logger::debug(format_args!("client disconnected: {peer:?}"));
 }
 
-fn run_server(addr: SocketAddr) -> std::io::Result<()> {
+fn run_server(addr: SocketAddr, policy: Arc<RuntimePolicy>) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     logger::info(format_args!("lcr listening on http://{addr}"));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                thread::spawn(move || handle_client(stream));
+                let policy = Arc::clone(&policy);
+                thread::spawn(move || handle_client(stream, &policy));
             }
             Err(err) => logger::error(format_args!("accept error: {err}")),
         }
@@ -240,8 +262,19 @@ fn main() -> ExitCode {
     }
     let cli = Cli::parse();
     logger::set_level(cli.log_level);
+    let (policy, config_path) = match RuntimePolicy::load(cli.config.as_deref()) {
+        Ok(value) => value,
+        Err(err) => {
+            logger::error(format_args!("{err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(path) = config_path {
+        logger::info(format_args!("loaded config: {}", path.display()));
+    }
+    let policy = Arc::new(policy);
     match cli.command {
-        None | Some(CliCommand::Serve) => match run_server(cli.listen) {
+        None | Some(CliCommand::Serve) => match run_server(cli.listen, policy) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 logger::error(format_args!("failed to start lcr: {err}"));
@@ -329,6 +362,17 @@ mod tests {
         ] {
             let cli = Cli::try_parse_from(arguments).expect("listen address should be valid");
             assert_eq!(cli.listen, "127.0.0.1:8080".parse().unwrap());
+        }
+    }
+
+    #[test]
+    fn config_path_is_configurable_globally() {
+        for arguments in [
+            vec!["lcr", "--config", "D:\\lcr.toml"],
+            vec!["lcr", "serve", "--config", "D:\\lcr.toml"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("config path should be valid");
+            assert_eq!(cli.config, Some(PathBuf::from("D:\\lcr.toml")));
         }
     }
 

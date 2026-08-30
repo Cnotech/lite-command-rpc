@@ -1,4 +1,4 @@
-use crate::{http::send_response, logger};
+use crate::{config::RuntimePolicy, http::send_response, logger};
 use serde::Deserialize;
 use std::{fs::File, io::Write, net::TcpStream, path::Path};
 
@@ -7,8 +7,7 @@ struct DownloadRequest {
     path: String,
 }
 
-fn send_file_response(stream: &mut TcpStream, path: &Path) -> std::io::Result<()> {
-    let mut file = File::open(path)?;
+fn send_file_response(stream: &mut TcpStream, file: &mut File, path: &Path) -> std::io::Result<()> {
     let file_size = file.metadata()?.len();
     let filename = path
         .file_name()
@@ -24,11 +23,11 @@ fn send_file_response(stream: &mut TcpStream, path: &Path) -> std::io::Result<()
          \r\n"
     );
     stream.write_all(headers.as_bytes())?;
-    std::io::copy(&mut file, stream)?;
+    std::io::copy(file, stream)?;
     stream.flush()
 }
 
-pub fn handle(stream: &mut TcpStream, body: &[u8]) {
+pub fn handle(stream: &mut TcpStream, body: &[u8], policy: &RuntimePolicy) {
     let request: DownloadRequest = match serde_json::from_slice(body) {
         Ok(req) => req,
         Err(err) => {
@@ -37,21 +36,18 @@ pub fn handle(stream: &mut TcpStream, body: &[u8]) {
             return;
         }
     };
-    let path = Path::new(&request.path);
-    if !path.exists() {
-        let body =
-            serde_json::json!({ "error": "file not found", "path": request.path }).to_string();
-        let _ = send_response(stream, "404 Not Found", &body, "application/json");
-        return;
-    }
-    if !path.is_file() {
-        let body =
-            serde_json::json!({ "error": "path is not a file", "path": request.path }).to_string();
-        let _ = send_response(stream, "400 Bad Request", &body, "application/json");
-        return;
-    }
+    let path = match policy.resolve_download(Path::new(&request.path)) {
+        Ok(path) => path,
+        Err(err) => {
+            let body = serde_json::json!({ "error": err }).to_string();
+            let _ = send_response(stream, "403 Forbidden", &body, "application/json");
+            return;
+        }
+    };
+    let mut path = path;
+    let file_path = path.path.clone();
     logger::info(format_args!("downloading: {}", request.path));
-    if let Err(err) = send_file_response(stream, path) {
+    if let Err(err) = send_file_response(stream, &mut path.file, &file_path) {
         logger::error(format_args!("download error: {err}"));
     }
 }

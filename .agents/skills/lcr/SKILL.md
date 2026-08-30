@@ -22,4 +22,6 @@ description: Use Lite Command RPC (lcr) on Windows to execute commands, manage a
 | `/download`：下载 Windows 主机上的文件。 | `/download -H "Content-Type: application/json" --data-raw '{"path":"D:\\Desktop\\test.7z"}' --output test.7z` | 文件二进制数据。 |
 | `/upload`：上传文件；目标已存在时不会覆盖。 | `/upload -H "Content-Type: application/octet-stream" -H "X-File-Path: D:\Desktop\uploaded.7z" --data-binary "@D:\Download\source.7z"` | `{"ok":true,"path":"D:\\Desktop\\uploaded.7z","bytes":123456}` |
 
+服务默认读取与 `lcr.exe` 同目录的 `lcr.toml`，也可用 `--config PATH` 指定。配置可通过 `work_dir` 将命令工作目录、上传和下载限制在允许目录内，并通过 `command_allowlist` 限制 `/exec`、`/exec/stream` 和 `/spawn`；普通条目为忽略大小写的前缀，`/…/` 条目为忽略大小写的正则。`work_dir` 为字符串时可作为省略 `cwd` 和相对文件路径的默认根目录；为字符串数组时命令必须显式指定位于任一允许根目录内的 `cwd`，文件传输必须使用绝对路径。Windows 上路径目录句柄会保持到操作完成，以防重解析点竞态。直接 `program` 调用按程序名及 JSON 引号化的全部参数匹配；白名单启用时禁用自定义绝对 `interpreter`。命令被策略拒绝时返回 HTTP 403，JSON `msg` 字段说明原因。
+
 需要完整字段、限制或错误语义时，查看 [README.md](https://github.com/Cnotech/lite-command-rpc/blob/master/README.md)。
