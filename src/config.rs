@@ -539,6 +539,13 @@ mod tests {
         assert!(matches!(config.work_dir, Some(WorkDirConfig::Many(values)) if values.len() == 2));
     }
 
+    #[test]
+    fn repository_example_is_valid_toml() {
+        let config: FileConfig = toml::from_str(include_str!("../lcr.toml.example")).unwrap();
+        assert!(matches!(config.work_dir, Some(WorkDirConfig::One(_))));
+        assert_eq!(config.command_allowlist.len(), 4);
+    }
+
     #[cfg(windows)]
     #[test]
     fn work_dir_boundary_comparison_is_case_insensitive_on_windows() {
