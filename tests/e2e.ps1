@@ -636,9 +636,10 @@ try {
     $configStdout = Join-Path $testRoot "config-server.stdout.log"
     $configStderr = Join-Path $testRoot "config-server.stderr.log"
     New-Item -ItemType Directory -Path $configRoot | Out-Null
+    Set-Content -LiteralPath (Join-Path $configRoot "marker.txt") -Value "marker"
     @"
 work_dir = '$configRoot'
-command_allowlist = ['echo ', '/^cd$/']
+command_allowlist = ['where.exe ', 'cmd.exe ']
 "@ | Set-Content -LiteralPath $configFile -Encoding utf8
     $configServer = Start-Process `
         -FilePath $binary `
@@ -650,7 +651,8 @@ command_allowlist = ['echo ', '/^cd$/']
     for ($attempt = 0; $attempt -lt 100; $attempt++) {
         try {
             $configCwd = Invoke-RestMethod -Method Post -Uri "$configBaseUri/exec" `
-                -ContentType "application/json" -Body '{"command":"cd"}'
+                -ContentType "application/json" `
+                -Body (@{ program = "where.exe"; args = @("/r", ".", "marker.txt") } | ConvertTo-Json -Compress)
             break
         }
         catch {
@@ -660,17 +662,18 @@ command_allowlist = ['echo ', '/^cd$/']
     }
     Assert-True $configCwd.ok "configured command should run"
     Assert-True `
-        ([string]::Equals($configCwd.stdout.Trim(), $configRoot, [System.StringComparison]::OrdinalIgnoreCase)) `
+        ($configCwd.stdout.Contains($configRoot)) `
         "omitted cwd should default to work_dir"
     $configEcho = Invoke-RestMethod -Method Post -Uri "$configBaseUri/exec" `
-        -ContentType "application/json" -Body '{"command":"ECHO config-ok"}'
-    Assert-True ($configEcho.stdout.Contains("config-ok")) "prefix matching should ignore case"
+        -ContentType "application/json" `
+        -Body (@{ program = "WHERE.EXE"; args = @("/r", ".", "marker.txt") } | ConvertTo-Json -Compress)
+    Assert-True ($configEcho.stdout.Contains("marker.txt")) "program prefix matching should ignore case"
     foreach ($blockedEndpoint in @("/exec", "/exec/stream", "/spawn")) {
         $blockedStatus = 0
         $blockedMsg = $null
         try {
             Invoke-RestMethod -Method Post -Uri "$configBaseUri$blockedEndpoint" `
-                -ContentType "application/json" -Body '{"command":"whoami"}' | Out-Null
+                -ContentType "application/json" -Body '{"program":"whoami.exe"}' | Out-Null
         }
         catch {
             $blockedStatus = [int]$_.Exception.Response.StatusCode
@@ -680,26 +683,47 @@ command_allowlist = ['echo ', '/^cd$/']
         }
         Assert-True ($blockedStatus -eq 403) "$blockedEndpoint should reject blocked commands"
         Assert-True `
-            ($blockedMsg -eq "command is not allowed by command_allowlist") `
-            "$blockedEndpoint should explain command rejection in msg"
+            (([string]$blockedMsg).Contains("program invocation is not allowed by command_allowlist")) `
+            "$blockedEndpoint should explain program rejection in msg"
+        Assert-True `
+            (([string]$blockedMsg).Contains('allowed program rules: [where.exe , cmd.exe ]')) `
+            "$blockedEndpoint should list allowed program rules in msg"
     }
-    $customInterpreterStatus = 0
-    $customInterpreterMsg = $null
+    foreach ($commandEndpoint in @("/exec", "/exec/stream", "/spawn")) {
+        $commandStatus = 0
+        $commandMsg = $null
+        try {
+            Invoke-RestMethod -Method Post -Uri "$configBaseUri$commandEndpoint" `
+                -ContentType "application/json" -Body '{"command":"echo blocked"}' | Out-Null
+        }
+        catch {
+            $commandStatus = [int]$_.Exception.Response.StatusCode
+            if (-not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+                $commandMsg = ($_.ErrorDetails.Message | ConvertFrom-Json).msg
+            }
+        }
+        Assert-True ($commandStatus -eq 403) "$commandEndpoint should disable command in allowlist mode"
+        Assert-True `
+            (([string]$commandMsg).Contains("command is disabled when command_allowlist is configured")) `
+            "$commandEndpoint should explain that program and args are required"
+    }
+    $interpreterStatus = 0
+    $interpreterMsg = $null
     try {
         Invoke-RestMethod -Method Post -Uri "$configBaseUri/exec" `
             -ContentType "application/json" `
-            -Body (@{ command = "echo allowed text"; interpreter = $python } | ConvertTo-Json -Compress) | Out-Null
+            -Body (@{ program = "cmd.exe"; args = @("/c", "echo blocked") } | ConvertTo-Json -Compress) | Out-Null
     }
     catch {
-        $customInterpreterStatus = [int]$_.Exception.Response.StatusCode
+        $interpreterStatus = [int]$_.Exception.Response.StatusCode
         if (-not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
-            $customInterpreterMsg = ($_.ErrorDetails.Message | ConvertFrom-Json).msg
+            $interpreterMsg = ($_.ErrorDetails.Message | ConvertFrom-Json).msg
         }
     }
-    Assert-True ($customInterpreterStatus -eq 403) "custom interpreters should not bypass allowlists"
+    Assert-True ($interpreterStatus -eq 403) "direct command interpreters should be rejected"
     Assert-True `
-        ($customInterpreterMsg -eq "custom absolute interpreters are not allowed when command_allowlist is configured") `
-        "custom interpreter rejection should explain the reason in msg"
+        (([string]$interpreterMsg).Contains("program is a forbidden command interpreter in allowlist mode: cmd")) `
+        "interpreter rejection should explain the reason in msg"
     $outsideStatus = 0
     try {
         Invoke-RestMethod -Method Post -Uri "$configBaseUri/download" `
@@ -741,9 +765,10 @@ command_allowlist = ['echo ', '/^cd$/']
     $arrayConfigStderr = Join-Path $testRoot "array-config-server.stderr.log"
     New-Item -ItemType Directory -Path $arrayRootA | Out-Null
     New-Item -ItemType Directory -Path $arrayRootB | Out-Null
+    Set-Content -LiteralPath (Join-Path $arrayRootB "marker.txt") -Value "marker"
     @"
 work_dir = ['$arrayRootA', '$arrayRootB']
-command_allowlist = ['echo ', '/^cd$/']
+command_allowlist = ['where.exe ']
 "@ | Set-Content -LiteralPath $arrayConfigFile -Encoding utf8
     $arrayConfigServer = Start-Process `
         -FilePath $binary `
@@ -757,7 +782,8 @@ command_allowlist = ['echo ', '/^cd$/']
     for ($attempt = 0; $attempt -lt 100; $attempt++) {
         try {
             Invoke-RestMethod -Method Post -Uri "$arrayConfigBaseUri/exec" `
-                -ContentType "application/json" -Body '{"command":"cd"}' | Out-Null
+                -ContentType "application/json" `
+                -Body (@{ program = "where.exe"; args = @("/r", ".", "marker.txt") } | ConvertTo-Json -Compress) | Out-Null
         }
         catch {
             if ($null -ne $_.Exception.Response) {
@@ -773,14 +799,18 @@ command_allowlist = ['echo ', '/^cd$/']
     }
     Assert-True ($missingCwdStatus -eq 403) "work_dir arrays should require cwd"
     Assert-True `
-        ($missingCwdMsg -eq "cwd is required when work_dir is configured as an array") `
+        (([string]$missingCwdMsg).Contains("cwd is required when work_dir is configured as an array")) `
         "missing cwd rejection should explain the reason in msg"
+    Assert-True `
+        (([string]$missingCwdMsg).Contains($arrayRootA) -and ([string]$missingCwdMsg).Contains($arrayRootB)) `
+        "missing cwd rejection should list every allowed work directory"
     foreach ($cwdEndpoint in @("/exec/stream", "/spawn")) {
         $endpointStatus = 0
         $endpointMsg = $null
         try {
             Invoke-RestMethod -Method Post -Uri "$arrayConfigBaseUri$cwdEndpoint" `
-                -ContentType "application/json" -Body '{"command":"cd"}' | Out-Null
+                -ContentType "application/json" `
+                -Body (@{ program = "where.exe"; args = @("/r", ".", "marker.txt") } | ConvertTo-Json -Compress) | Out-Null
         }
         catch {
             $endpointStatus = [int]$_.Exception.Response.StatusCode
@@ -790,15 +820,18 @@ command_allowlist = ['echo ', '/^cd$/']
         }
         Assert-True ($endpointStatus -eq 403) "$cwdEndpoint should require cwd for work_dir arrays"
         Assert-True `
-            ($endpointMsg -eq "cwd is required when work_dir is configured as an array") `
+            (([string]$endpointMsg).Contains("cwd is required when work_dir is configured as an array")) `
             "$cwdEndpoint should explain the missing cwd in msg"
+        Assert-True `
+            (([string]$endpointMsg).Contains($arrayRootA) -and ([string]$endpointMsg).Contains($arrayRootB)) `
+            "$cwdEndpoint should list every allowed work directory"
     }
     $arrayCwdResult = Invoke-RestMethod -Method Post -Uri "$arrayConfigBaseUri/exec" `
         -ContentType "application/json" `
-        -Body (@{ command = "cd"; cwd = $arrayRootB } | ConvertTo-Json -Compress)
+        -Body (@{ program = "where.exe"; args = @("/r", ".", "marker.txt"); cwd = $arrayRootB } | ConvertTo-Json -Compress)
     Assert-True $arrayCwdResult.ok "an explicitly selected array work_dir should be allowed"
     Assert-True `
-        ([string]::Equals($arrayCwdResult.stdout.Trim(), $arrayRootB, [System.StringComparison]::OrdinalIgnoreCase)) `
+        ($arrayCwdResult.stdout.Contains($arrayRootB)) `
         "the command should run in the selected array work_dir"
     foreach ($cwdEndpoint in @("/exec", "/exec/stream", "/spawn")) {
         $outsideCwdStatus = 0
@@ -806,7 +839,7 @@ command_allowlist = ['echo ', '/^cd$/']
         try {
             Invoke-RestMethod -Method Post -Uri "$arrayConfigBaseUri$cwdEndpoint" `
                 -ContentType "application/json" `
-                -Body (@{ command = "echo outside"; cwd = $testRoot } | ConvertTo-Json -Compress) | Out-Null
+                -Body (@{ program = "where.exe"; args = @("/r", ".", "marker.txt"); cwd = $testRoot } | ConvertTo-Json -Compress) | Out-Null
         }
         catch {
             $outsideCwdStatus = [int]$_.Exception.Response.StatusCode
@@ -818,6 +851,9 @@ command_allowlist = ['echo ', '/^cd$/']
         Assert-True `
             ([string]$outsideCwdMsg).Contains("outside configured work_dir") `
             "$cwdEndpoint should explain the cwd boundary violation in msg"
+        Assert-True `
+            (([string]$outsideCwdMsg).Contains($arrayRootA) -and ([string]$outsideCwdMsg).Contains($arrayRootB)) `
+            "$cwdEndpoint should list every allowed work directory"
     }
     $arraySource = Join-Path $testRoot "array-source.bin"
     $arrayRootAFile = Join-Path $arrayRootA "from-a.bin"

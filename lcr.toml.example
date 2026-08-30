@@ -1,16 +1,13 @@
 # 字符串模式：执行请求省略 cwd 时，默认使用此目录。
-work_dir = "."
+# 数组模式：允许多个根目录，此时执行请求必须提供绝对 cwd，上传和下载也必须使用绝对路径。
 
-# 数组模式：如需允许多个根目录，请删除上面的字符串配置并取消下面一行的注释。
-# 此时执行请求必须提供绝对 cwd，上传和下载也必须使用绝对路径。
+# work_dir = "."
 # work_dir = ['D:\WorkspaceA', 'D:\WorkspaceB']
 
-# 普通字符串按忽略大小写的前缀匹配；使用 /.../ 包裹的值按忽略大小写的正则表达式匹配。
-# 删除此字段或设置为空数组 [] 表示允许所有命令。
-# 使用 program 直接执行时，参数会转换为 JSON 字符串并参与匹配。
-command_allowlist = [
-  "echo ",
-  "git status",
-  "/^cargo (check|test)( |$)/",
-  '/^git\.exe "status"$/',
-]
+# 普通字符串按忽略大小写的调用前缀匹配；使用 /.../ 包裹的值按忽略大小写的正则表达式匹配。
+# 启用后会仅允许使用 cmd，并严格要求通过 program + args 的形式调用
+# command_allowlist = [
+#   "notepad.exe ",
+#   '/^git(\.exe)? "status"$/',
+#   '/^cargo(\.exe)? "(check|test)"/',
+# ]

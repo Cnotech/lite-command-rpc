@@ -1,10 +1,39 @@
-use crate::process::{ExecRequest, ScriptInterpreter};
+use crate::process::ExecRequest;
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::{
     fs::{self, File},
     path::{Component, Path, PathBuf},
 };
+
+const FORBIDDEN_PROGRAM_INTERPRETERS: &[&str] = &[
+    "bash",
+    "bun",
+    "cmd",
+    "command",
+    "cscript",
+    "deno",
+    "dotnet",
+    "fish",
+    "java",
+    "javaw",
+    "mshta",
+    "node",
+    "perl",
+    "php",
+    "powershell",
+    "powershell_ise",
+    "pwsh",
+    "py",
+    "python",
+    "python3",
+    "pythonw",
+    "ruby",
+    "sh",
+    "wscript",
+    "wsl",
+    "zsh",
+];
 
 #[derive(Debug, Default)]
 pub(crate) struct PathGuard {
@@ -117,20 +146,35 @@ impl RuntimePolicy {
 
     pub fn prepare_exec(&self, request: &mut ExecRequest) -> Result<(), String> {
         if !self.command_allowlist.is_empty() {
-            if matches!(request.interpreter, Some(ScriptInterpreter::Absolute(_))) {
-                return Err(
-                    "custom absolute interpreters are not allowed when command_allowlist is configured"
-                        .to_string(),
-                );
+            if request.command.is_some() {
+                return Err(format!(
+                    "command is disabled when command_allowlist is configured; use program and args; {}",
+                    self.allowed_programs_message()
+                ));
             }
-            let candidate = command_candidate(request)
-                .ok_or_else(|| "either command or program is required".to_string())?;
+            let program = request.program.as_deref().ok_or_else(|| {
+                format!(
+                    "program is required when command_allowlist is configured; {}",
+                    self.allowed_programs_message()
+                )
+            })?;
+            if let Some(interpreter) = forbidden_program_interpreter(program) {
+                return Err(format!(
+                    "program is a forbidden command interpreter in allowlist mode: {interpreter}; forbidden interpreters: [{}]; {}",
+                    FORBIDDEN_PROGRAM_INTERPRETERS.join(", "),
+                    self.allowed_programs_message()
+                ));
+            }
+            let candidate = command_candidate(request).expect("allowlist requests require program");
             if !self
                 .command_allowlist
                 .iter()
                 .any(|rule| rule.matches(&candidate))
             {
-                return Err("command is not allowed by command_allowlist".to_string());
+                return Err(format!(
+                    "program invocation is not allowed by command_allowlist; {}",
+                    self.allowed_programs_message()
+                ));
             }
         }
         if self.work_dirs.is_empty() {
@@ -140,13 +184,19 @@ impl RuntimePolicy {
             Some(cwd) => self.resolve_existing(Path::new(cwd))?,
             None => {
                 let path = self.default_work_dir.clone().ok_or_else(|| {
-                    "cwd is required when work_dir is configured as an array".to_string()
+                    format!(
+                        "cwd is required when work_dir is configured as an array; {}",
+                        self.allowed_work_dirs_message()
+                    )
                 })?;
                 self.guard_existing(path)?
             }
         };
         if !cwd.path.is_dir() {
-            return Err("cwd must be an existing directory".to_string());
+            return Err(format!(
+                "cwd must be an existing directory; {}",
+                self.allowed_work_dirs_message()
+            ));
         }
         request.cwd = Some(cwd.path.to_string_lossy().into_owned());
         request.cwd_guard = Some(cwd._guard);
@@ -189,15 +239,19 @@ impl RuntimePolicy {
         } else {
             self.default_work_dir
                 .as_ref()
-                .ok_or_else(relative_path_with_multiple_roots)?
+                .ok_or_else(|| self.relative_path_with_multiple_roots())?
                 .join(path)
         };
         let file_name = joined
             .file_name()
             .ok_or_else(|| "destination must include a file name".to_string())?;
         let parent = joined.parent().unwrap_or_else(|| Path::new("."));
-        let parent = fs::canonicalize(parent)
-            .map_err(|err| format!("destination directory does not exist: {err}"))?;
+        let parent = fs::canonicalize(parent).map_err(|err| {
+            format!(
+                "destination directory does not exist: {err}; {}",
+                self.allowed_work_dirs_message()
+            )
+        })?;
         self.ensure_within_root(&parent)?;
         let parent = self.guard_existing(parent)?;
         Ok(GuardedPath {
@@ -212,11 +266,16 @@ impl RuntimePolicy {
         } else {
             self.default_work_dir
                 .as_ref()
-                .ok_or_else(relative_path_with_multiple_roots)?
+                .ok_or_else(|| self.relative_path_with_multiple_roots())?
                 .join(path)
         };
-        let resolved = fs::canonicalize(&joined)
-            .map_err(|err| format!("path does not exist: {}: {err}", joined.display()))?;
+        let resolved = fs::canonicalize(&joined).map_err(|err| {
+            format!(
+                "path does not exist: {}: {err}; {}",
+                joined.display(),
+                self.allowed_work_dirs_message()
+            )
+        })?;
         self.ensure_within_root(&resolved)?;
         self.guard_existing(resolved)
     }
@@ -242,10 +301,36 @@ impl RuntimePolicy {
             Ok(())
         } else {
             Err(format!(
-                "path is outside configured work_dir: {}",
-                path.display()
+                "path is outside configured work_dir: {}; {}",
+                path.display(),
+                self.allowed_work_dirs_message()
             ))
         }
+    }
+
+    fn allowed_programs_message(&self) -> String {
+        let rules = self
+            .command_allowlist
+            .iter()
+            .map(CommandRule::description)
+            .collect::<Vec<_>>();
+        format!("allowed program rules: [{}]", rules.join(", "))
+    }
+
+    fn allowed_work_dirs_message(&self) -> String {
+        let paths = self
+            .work_dirs
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        format!("allowed work directories: [{}]", paths.join(", "))
+    }
+
+    fn relative_path_with_multiple_roots(&self) -> String {
+        format!(
+            "relative paths are not allowed when work_dir is an array; use an absolute path; {}",
+            self.allowed_work_dirs_message()
+        )
     }
 }
 
@@ -371,10 +456,6 @@ fn path_starts_with(path: &Path, root: &Path) -> bool {
     path.starts_with(root)
 }
 
-fn relative_path_with_multiple_roots() -> String {
-    "relative paths are not allowed when work_dir is an array; use an absolute path".to_string()
-}
-
 fn command_candidate(request: &ExecRequest) -> Option<String> {
     if let Some(command) = &request.command {
         return Some(command.clone());
@@ -389,11 +470,39 @@ fn command_candidate(request: &ExecRequest) -> Option<String> {
     Some(candidate)
 }
 
+fn forbidden_program_interpreter(program: &str) -> Option<&'static str> {
+    let name = program
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    FORBIDDEN_PROGRAM_INTERPRETERS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == name)
+        .or_else(|| {
+            let suffix = name.strip_prefix("python")?;
+            (!suffix.is_empty()
+                && suffix
+                    .chars()
+                    .all(|character| character.is_ascii_digit() || character == '.'))
+            .then_some("python")
+        })
+}
+
 impl CommandRule {
     fn matches(&self, command: &str) -> bool {
         match self {
             Self::Prefix(prefix) => command.to_lowercase().starts_with(&prefix.to_lowercase()),
             Self::Regex(regex) => regex.is_match(command),
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::Prefix(prefix) => prefix.clone(),
+            Self::Regex(regex) => format!("/{}/", regex.as_str()),
         }
     }
 }
@@ -519,10 +628,10 @@ mod tests {
             command_allowlist: Vec::new(),
         };
         let mut missing = serde_json::from_str::<ExecRequest>(r#"{"command":"echo hi"}"#).unwrap();
-        assert_eq!(
-            policy.prepare_exec(&mut missing).unwrap_err(),
-            "cwd is required when work_dir is configured as an array"
-        );
+        let error = policy.prepare_exec(&mut missing).unwrap_err();
+        assert!(error.contains("cwd is required when work_dir is configured as an array"));
+        assert!(error.contains(&root.to_string_lossy().to_string()));
+        assert!(error.contains(&other.to_string_lossy().to_string()));
         let mut explicit = serde_json::from_value::<ExecRequest>(serde_json::json!({
             "command": "echo hi",
             "cwd": other,
@@ -541,9 +650,7 @@ mod tests {
 
     #[test]
     fn repository_example_is_valid_toml() {
-        let config: FileConfig = toml::from_str(include_str!("../lcr.toml.example")).unwrap();
-        assert!(matches!(config.work_dir, Some(WorkDirConfig::One(_))));
-        assert_eq!(config.command_allowlist.len(), 4);
+        let _: FileConfig = toml::from_str(include_str!("../lcr.toml.example")).unwrap();
     }
 
     #[cfg(windows)]
@@ -592,27 +699,51 @@ mod tests {
             "args": ["push"]
         }))
         .unwrap();
-        assert_eq!(
-            policy.prepare_exec(&mut blocked).unwrap_err(),
-            "command is not allowed by command_allowlist"
-        );
+        let error = policy.prepare_exec(&mut blocked).unwrap_err();
+        assert!(error.contains("program invocation is not allowed by command_allowlist"));
+        assert!(error.contains(r#"/^git\.exe "status"$/"#));
     }
 
     #[test]
-    fn allowlist_rejects_custom_absolute_interpreters() {
+    fn allowlist_disables_command_requests() {
         let policy = RuntimePolicy {
             work_dirs: Vec::new(),
             default_work_dir: None,
             command_allowlist: vec![parse_command_rule("echo ".to_string()).unwrap()],
         };
         let mut request = serde_json::from_value::<ExecRequest>(serde_json::json!({
-            "command": "echo allowed text",
-            "interpreter": "C:\\tools\\custom.exe"
+            "command": "echo allowed text"
         }))
         .unwrap();
-        assert_eq!(
-            policy.prepare_exec(&mut request).unwrap_err(),
-            "custom absolute interpreters are not allowed when command_allowlist is configured"
-        );
+        let error = policy.prepare_exec(&mut request).unwrap_err();
+        assert!(error.contains("command is disabled when command_allowlist is configured"));
+        assert!(error.contains("allowed program rules: [echo ]"));
+    }
+
+    #[test]
+    fn allowlist_rejects_direct_command_interpreters() {
+        let policy = RuntimePolicy {
+            work_dirs: Vec::new(),
+            default_work_dir: None,
+            command_allowlist: vec![parse_command_rule("/".to_string()).unwrap()],
+        };
+        for program in [
+            r"C:\Windows\System32\CMD.EXE",
+            "pwsh.exe",
+            "powershell.exe",
+            "python3.13.exe",
+            "node.exe",
+            "wscript.exe",
+        ] {
+            let mut request = serde_json::from_value::<ExecRequest>(serde_json::json!({
+                "program": program,
+            }))
+            .unwrap();
+            let error = policy.prepare_exec(&mut request).unwrap_err();
+            assert!(
+                error.contains("program is a forbidden command interpreter in allowlist mode"),
+                "unexpected error for {program}: {error}"
+            );
+        }
     }
 }
