@@ -1,5 +1,5 @@
 use crate::process::ExecRequest;
-use regex::{Regex, RegexBuilder};
+use regex::bytes::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::{
     fs::{self, File},
@@ -495,7 +495,7 @@ impl CommandRule {
     fn matches(&self, command: &str) -> bool {
         match self {
             Self::Prefix(prefix) => command.to_lowercase().starts_with(&prefix.to_lowercase()),
-            Self::Regex(regex) => regex.is_match(command),
+            Self::Regex(regex) => regex.is_match(command.as_bytes()),
         }
     }
 
@@ -514,6 +514,7 @@ fn parse_command_rule(value: String) -> Result<CommandRule, String> {
             return Err("command_allowlist regex cannot be empty".to_string());
         }
         return RegexBuilder::new(pattern)
+            .unicode(false)
             .case_insensitive(true)
             .build()
             .map(CommandRule::Regex)
@@ -537,6 +538,12 @@ mod tests {
         assert!(!prefix.matches("xecho hello"));
         assert!(regex.matches("GIT STATUS"));
         assert!(!regex.matches("git push"));
+    }
+
+    #[test]
+    fn allowlist_regex_wildcards_match_unicode_arguments_as_utf8_bytes() {
+        let regex = parse_command_rule(r#"/^tool \".*\"$/"#.to_string()).unwrap();
+        assert!(regex.matches(r#"tool "中文参数""#));
     }
 
     #[test]
@@ -615,6 +622,12 @@ mod tests {
     #[test]
     fn rejects_an_invalid_allowlist_regex() {
         let error = parse_command_rule("/[unterminated/".to_string()).unwrap_err();
+        assert!(error.contains("invalid command_allowlist regex"));
+    }
+
+    #[test]
+    fn rejects_unicode_allowlist_regex_features() {
+        let error = parse_command_rule(r"/^\p{Greek}+$/".to_string()).unwrap_err();
         assert!(error.contains("invalid command_allowlist regex"));
     }
 

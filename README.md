@@ -71,7 +71,7 @@ work_dir = ["D:\\WorkspaceA", "D:\\WorkspaceB"]
 - 路径会经过规范化和目录边界检查。Windows 上会在操作期间锁定规范化路径的各级目录，拒绝残留的重解析点，并根据实际打开的文件句柄复核下载源，防止通过并发替换符号链接或目录联接越界。
 - 多行命令所需的临时脚本也会创建在允许的工作目录内。
 
-设置非空 `command_allowlist` 后，`command`（或直接执行请求中的 `program`）必须至少匹配一条规则。普通字符串采用“以该字符串开头”的匹配方式；以 `/` 开头并以 `/` 结尾的值视为正则表达式。空数组或省略该字段表示不限制命令。
+设置非空 `command_allowlist` 后，`command`（或直接执行请求中的 `program`）必须至少匹配一条规则。普通字符串采用“以该字符串开头”的匹配方式；以 `/` 开头并以 `/` 结尾的值视为正则表达式。正则按 UTF-8 字节匹配，支持 ASCII 字符类和 ASCII 大小写匹配；`.*` 等表达式仍可覆盖 Unicode 参数，但不支持 Unicode 属性、Unicode 字符类或 Unicode 大小写折叠。使用不受支持的表达式会导致配置加载失败。空数组或省略该字段表示不限制命令。
 
 直接执行 `program` 时，匹配文本由程序名及所有参数组成，参数使用 JSON 字符串形式加引号。例如 `{"program":"git.exe","args":["status"]}` 的匹配文本是 `git.exe "status"`。白名单启用时不允许使用自定义绝对 `interpreter`，避免解释器本身绕过命令规则；仍可使用内置的 `cmd` 或 `pwsh`。
 
@@ -88,6 +88,8 @@ work_dir = ["D:\\WorkspaceA", "D:\\WorkspaceB"]
 ```powershell
 cargo build -r
 ```
+
+发布构建针对单文件体积启用了尺寸优化、LTO、符号剥离和 panic abort，因此链接耗时会比默认 release 配置更长。
 
 构建产物位于：
 
