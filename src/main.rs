@@ -52,7 +52,7 @@ use std::{
 #[derive(Debug, Parser)]
 #[command(name = "lcr", version, verbatim_doc_comment)]
 struct Cli {
-    /// TOML config path; defaults to lcr.toml next to lcr.exe when present
+    /// TOML config path; otherwise searches the current directory, then next to lcr.exe
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
 

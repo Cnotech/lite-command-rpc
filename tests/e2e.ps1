@@ -82,10 +82,11 @@ $testRoot = Join-Path $env:RUNNER_TEMP ("lcr-e2e-" + [guid]::NewGuid().ToString(
 $serverStdout = Join-Path $testRoot "server.stdout.log"
 $serverStderr = Join-Path $testRoot "server.stderr.log"
 $server = $null
+$cwdConfigServer = $null
 $configServer = $null
 $arrayConfigServer = $null
 $failed = $false
-$script:ExpectedCaseCount = 26
+$script:ExpectedCaseCount = 27
 $script:CaseCount = 0
 $script:PassedCaseCount = 0
 $script:CurrentCase = $null
@@ -117,6 +118,7 @@ try {
     $server = Start-Process `
         -FilePath $binary `
         -ArgumentList @("serve", "--listen", $listenAddress, "--log-level", "debug") `
+        -WorkingDirectory $testRoot `
         -PassThru `
         -RedirectStandardOutput $serverStdout `
         -RedirectStandardError $serverStderr
@@ -628,6 +630,46 @@ try {
         "streaming execution should log its timeout status"
     Complete-E2ECase
 
+    Start-E2ECase "Config discovery from current working directory"
+    $cwdConfigPort = Get-FreeTcpPort
+    $cwdConfigAddress = "${listenHost}:$cwdConfigPort"
+    $cwdConfigDirectory = Join-Path $testRoot "cwd-config"
+    $cwdConfigRoot = Join-Path $testRoot "cwd-config-root"
+    $cwdConfigStdout = Join-Path $testRoot "cwd-config-server.stdout.log"
+    $cwdConfigStderr = Join-Path $testRoot "cwd-config-server.stderr.log"
+    New-Item -ItemType Directory -Path $cwdConfigDirectory | Out-Null
+    New-Item -ItemType Directory -Path $cwdConfigRoot | Out-Null
+    Set-Content -LiteralPath (Join-Path $cwdConfigRoot "cwd-marker.txt") -Value "marker"
+    @"
+work_dir = '$cwdConfigRoot'
+command_allowlist = ['where.exe ']
+"@ | Set-Content -LiteralPath (Join-Path $cwdConfigDirectory "lcr.toml") -Encoding utf8
+    $cwdConfigServer = Start-Process `
+        -FilePath $binary `
+        -ArgumentList @("serve", "--listen", $cwdConfigAddress) `
+        -WorkingDirectory $cwdConfigDirectory `
+        -PassThru `
+        -RedirectStandardOutput $cwdConfigStdout `
+        -RedirectStandardError $cwdConfigStderr
+    $cwdConfigBaseUri = "http://$cwdConfigAddress"
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+        try {
+            $cwdConfigResult = Invoke-RestMethod -Method Post -Uri "$cwdConfigBaseUri/exec" `
+                -ContentType "application/json" `
+                -Body (@{ program = "where.exe"; args = @("/r", ".", "cwd-marker.txt") } | ConvertTo-Json -Compress)
+            break
+        }
+        catch {
+            if ($cwdConfigServer.HasExited) { throw "cwd-configured lcr exited before becoming ready" }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    Assert-True $cwdConfigResult.ok "current-directory config should be loaded"
+    Assert-True `
+        ($cwdConfigResult.stdout.Contains($cwdConfigRoot)) `
+        "current-directory config should set the default work_dir"
+    Complete-E2ECase
+
     Start-E2ECase "Config work directory and command allowlist"
     $configPort = Get-FreeTcpPort
     $configAddress = "${listenHost}:$configPort"
@@ -644,6 +686,7 @@ command_allowlist = ['where.exe ', 'cmd.exe ']
     $configServer = Start-Process `
         -FilePath $binary `
         -ArgumentList @("serve", "--listen", $configAddress, "--config", $configFile) `
+        -WorkingDirectory $cwdConfigDirectory `
         -PassThru `
         -RedirectStandardOutput $configStdout `
         -RedirectStandardError $configStderr
@@ -929,6 +972,10 @@ finally {
     if ($null -ne $server -and -not $server.HasExited) {
         Stop-Process -Id $server.Id -Force
         Wait-Process -Id $server.Id -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $cwdConfigServer -and -not $cwdConfigServer.HasExited) {
+        Stop-Process -Id $cwdConfigServer.Id -Force
+        Wait-Process -Id $cwdConfigServer.Id -ErrorAction SilentlyContinue
     }
     if ($null -ne $configServer -and -not $configServer.HasExited) {
         Stop-Process -Id $configServer.Id -Force

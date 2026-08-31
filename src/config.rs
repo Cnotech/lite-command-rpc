@@ -84,20 +84,36 @@ pub struct RuntimePolicy {
 
 impl RuntimePolicy {
     pub fn load(path: Option<&Path>) -> Result<(Self, Option<PathBuf>), String> {
-        let (path, required) = match path {
-            Some(path) => (path.to_path_buf(), true),
-            None => {
-                let exe = std::env::current_exe()
-                    .map_err(|err| format!("failed to locate lcr.exe: {err}"))?;
-                (exe.with_file_name("lcr.toml"), false)
-            }
-        };
-        if !path.exists() && !required {
-            return Ok((Self::default(), None));
+        if let Some(path) = path {
+            let path = path.to_path_buf();
+            let text = fs::read_to_string(&path)
+                .map_err(|err| format!("failed to read config {}: {err}", path.display()))?;
+            return Ok((Self::parse_config(&path, &text)?, Some(path)));
         }
-        let text = fs::read_to_string(&path)
-            .map_err(|err| format!("failed to read config {}: {err}", path.display()))?;
-        let config: FileConfig = toml::from_str(&text)
+
+        let current_dir = std::env::current_dir()
+            .map_err(|err| format!("failed to locate current working directory: {err}"))?;
+        let exe =
+            std::env::current_exe().map_err(|err| format!("failed to locate lcr.exe: {err}"))?;
+        Self::load_default(&current_dir, &exe)
+    }
+
+    fn load_default(current_dir: &Path, exe: &Path) -> Result<(Self, Option<PathBuf>), String> {
+        for path in [current_dir.join("lcr.toml"), exe.with_file_name("lcr.toml")] {
+            let text = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(format!("failed to read config {}: {err}", path.display()));
+                }
+            };
+            return Ok((Self::parse_config(&path, &text)?, Some(path)));
+        }
+        Ok((Self::default(), None))
+    }
+
+    fn parse_config(path: &Path, text: &str) -> Result<Self, String> {
+        let config: FileConfig = toml::from_str(text)
             .map_err(|err| format!("invalid config {}: {err}", path.display()))?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
         let (work_dirs, has_default) = match config.work_dir {
@@ -134,14 +150,11 @@ impl RuntimePolicy {
             .into_iter()
             .map(parse_command_rule)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((
-            Self {
-                work_dirs,
-                default_work_dir,
-                command_allowlist,
-            },
-            Some(path),
-        ))
+        Ok(Self {
+            work_dirs,
+            default_work_dir,
+            command_allowlist,
+        })
     }
 
     pub fn prepare_exec(&self, request: &mut ExecRequest) -> Result<(), String> {
@@ -615,6 +628,43 @@ mod tests {
             Some(fs::canonicalize(work_dir).unwrap())
         );
         assert_eq!(policy.command_allowlist.len(), 2);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn default_config_loads_in_order_and_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "lcr-config-discovery-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let current_dir = root.join("current");
+        let exe_dir = root.join("bin");
+        fs::create_dir_all(&current_dir).unwrap();
+        fs::create_dir_all(&exe_dir).unwrap();
+        let current_config = current_dir.join("lcr.toml");
+        let exe_config = exe_dir.join("lcr.toml");
+        let exe = exe_dir.join("lcr.exe");
+
+        fs::write(&exe_config, "command_allowlist = ['exe-rule']").unwrap();
+        let (exe_policy, loaded_path) = RuntimePolicy::load_default(&current_dir, &exe).unwrap();
+        assert_eq!(loaded_path, Some(exe_config));
+        assert_eq!(exe_policy.command_allowlist.len(), 1);
+
+        fs::write(&current_config, "command_allowlist = ['cwd-rule']").unwrap();
+        let (cwd_policy, loaded_path) = RuntimePolicy::load_default(&current_dir, &exe).unwrap();
+        assert_eq!(loaded_path, Some(current_config.clone()));
+        assert_eq!(cwd_policy.command_allowlist.len(), 1);
+
+        fs::remove_file(&current_config).unwrap();
+        fs::create_dir(&current_config).unwrap();
+        let error = RuntimePolicy::load_default(&current_dir, &exe).unwrap_err();
+        assert!(error.contains("failed to read config"));
+        assert!(error.contains(&current_config.to_string_lossy().to_string()));
 
         fs::remove_dir_all(root).unwrap();
     }
