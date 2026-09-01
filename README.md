@@ -1,184 +1,181 @@
 # Lite Command RPC
 
-Lite Command RPC 是一个面向 Windows 的轻量级 HTTP 命令执行服务，可为 Agent 或自动化工具提供远程执行命令、上传文件和下载文件的简单入口。
+面向 Windows 的轻量级 HTTP 命令执行服务，为 Agent、自动化工具和 Windows PE 排障环境提供统一的远程操作入口。
 
-> [!IMPORTANT]
-> 本项目专为 Windows PE 场景下的问题排查设计，仅适配 Windows 平台。
+LCR 以单个 `lcr.exe` 运行，无额外运行时依赖，支持同步、流式和异步命令执行，以及屏幕、窗口、键鼠和文件操作。
 
-## 特性
+> [!WARNING]
+> 对外暴露 LCR 控制端口是非常危险的，请确保仅在可信网络中使用。
 
-- 普通或流式或异步执行 Windows 命令
-- 屏幕截图
-- 窗口枚举
-- 模拟键盘和鼠标输入
-- 上传和下载文件
-- 单文件运行，无额外运行时依赖，轻量级实现
+> [!NOTE]
+> 本项目仅支持 Windows 平台，主要面向 Windows PE 和 Windows 自动化场景。
 
-## 下载
-从 [GitHub Releases](https://github.com/Cnotech/lite-command-rpc/releases) 下载最新的 Windows ZIP 压缩包
+## 目录
 
-## 使用
+- [功能特性](#功能特性)
+- [快速开始](#快速开始)
+- [命令行选项](#命令行选项)
+- [安全配置](#安全配置)
+- [API 参考](#api-参考)
+- [从源码构建](#从源码构建)
+- [项目定位](#项目定位)
 
-解压后运行：
+## 功能特性
 
-```powershell
-.\lcr.exe
-```
+- 同步执行命令并返回完整结果
+- 通过 NDJSON 实时返回 stdout 和 stderr
+- 异步启动、查询和终止命令
+- 超时或主动终止时清理整个进程树
+- 截取主屏幕、枚举窗口并模拟键盘鼠标输入
+- 流式上传和下载文件
+- 通过工作目录、命令白名单和 UAC 开关收敛权限
+- 配置文件热重载
+- 单文件分发，无额外运行时依赖
 
-服务默认监听所有网络接口的 `9527` 端口，可通过 `--listen` 修改监听地址，例如仅允许本机访问：
+## 快速开始
+
+### 1. 下载
+
+从 [GitHub Releases](https://github.com/Cnotech/lite-command-rpc/releases) 下载最新的 Windows ZIP 压缩包并解压。
+
+### 2. 启动服务
 
 ```powershell
 .\lcr.exe --listen 127.0.0.1:9527
-.\lcr.exe --listen [::1]:9527
 ```
 
-也可以使用 `.\lcr.exe serve` 显式启动服务；其行为与不带参数运行相同。
+`lcr.exe serve` 与不带子命令启动的行为相同。若不指定 `--listen`，服务默认监听 `0.0.0.0:9527`。
 
-### 配置文件
-
-启动时按以下优先级查找配置文件：`--config` 显式指定的路径、当前工作目录下的 `lcr.toml`、与 `lcr.exe` 同目录的 `lcr.toml`。自动查找时只有文件不存在才会继续查找下一位置，权限不足等其他读取错误会导致服务拒绝启动。两个默认位置都不存在时沿用不受配置限制的兼容行为；显式指定的文件不存在或任何选中的配置内容无效时，服务也会拒绝启动：
+### 3. 发送请求
 
 ```powershell
-.\lcr.exe serve --config D:\Config\lcr.toml
+curl -X POST http://127.0.0.1:9527/exec `
+  -H "Content-Type: application/json" `
+  --data-raw '{"program":"cmd.exe","args":["/d","/s","/c","ver"]}'
 ```
 
-当启动时成功加载了配置文件，LCR 会使用 Windows 文件事件监听该配置文件本身。文件被修改或通过原子替换保存后，父进程会在短暂防抖后先验证新配置；验证成功才重启 HTTP worker，使所有配置项都在同一进程生命周期内生效。验证失败或文件被删除时，当前 worker 会继续按最后一次有效配置运行，并输出错误日志。启动时未找到默认配置文件则不会创建监听器，仍按原有无配置模式运行；运行中新增默认配置文件也不会自动启用配置。重启会中断正在处理的 HTTP 请求及非 detached 命令。
+响应示例：
 
-配置示例：
+```json
+{
+  "ok": true,
+  "exit_code": 0,
+  "stdout": "Microsoft Windows ...",
+  "stderr": "",
+  "timed_out": false,
+  "error": null
+}
+```
+
+## 命令行选项
+
+```text
+lcr.exe [OPTIONS] [COMMAND]
+
+Commands:
+  serve  （可省略）启动 HTTP 服务
+
+Options:
+  --listen <IP:PORT>   监听地址，默认 0.0.0.0:9527
+  --config <PATH>      显式指定 TOML 配置文件
+  --log-level <LEVEL>  日志级别，默认 info
+  -h, --help           显示帮助
+  -V, --version        显示版本
+```
+
+例如仅监听 IPv6 本地回环地址：
+
+```powershell
+.\lcr.exe --listen "[::1]:9527"
+```
+
+## 安全配置
+
+建议从仓库中的 [`lcr.toml.example`](./lcr.toml.example) 复制配置，并至少设置 `work_dir` 和 `command_allowlist`：
 
 ```toml
 # 相对路径以 lcr.toml 所在目录为基准，目录必须已经存在。
 work_dir = "workspace"
 
-# 普通字符串按命令开头匹配；/…/ 表示正则表达式。两者均忽略大小写。
+# 普通字符串按前缀匹配；/…/ 中的内容按正则表达式匹配。
+# 两种规则均忽略 ASCII 大小写。
 command_allowlist = [
-  "echo ",
-  "git status",
-  "/^cargo (check|test)( |$)/",
+  '/^git(\.exe)? "status"$/',
+  '/^cargo(\.exe)? "(check|test)"/',
+  "WimBuilder.cmd",
 ]
 
-# 默认关闭。仅在可信网络中确实需要按请求触发 UAC 时启用。
-allow_elevation = true
+# 是否允许请求通过 require_admin = true 进行 UAC 提权；默认关闭。
+allow_elevation = false
 ```
 
-`work_dir` 也可以配置为目录数组：
+### 配置文件查找与热重载
+
+启动时按以下顺序选择配置：
+
+1. `--config PATH` 显式指定的文件
+2. 当前工作目录中的 `lcr.toml`
+3. `lcr.exe` 同目录中的 `lcr.toml`
+
+自动查找时，只有文件不存在才会继续查找下一位置。文件无法读取、字段未知或内容无效时，服务会拒绝启动；两个默认位置都没有配置文件时，则以不受配置策略限制的兼容模式运行。
+
+成功加载配置后，LCR 会监视该文件。修改或原子替换文件时，新配置会先经过验证，再通过重启 HTTP worker 生效。无效配置或文件被删除不会覆盖最后一次有效配置。worker 重启会中断正在处理的 HTTP 请求和非 detached 命令。
+
+启动时未找到默认配置文件，则本次运行不会监听之后新建的配置文件。
+
+### 限制工作目录
+
+`work_dir` 可以是单个目录：
+
+```toml
+work_dir = "D:\\Workspace"
+```
+
+此时：
+
+- 未传 `cwd` 的命令默认在该目录运行。
+- 相对 `cwd`、上传路径和下载路径均以该目录为根。
+- 命令工作目录、临时脚本和文件传输路径不能越过该目录边界。
+
+也可以允许多个目录：
 
 ```toml
 work_dir = ["D:\\WorkspaceA", "D:\\WorkspaceB"]
 ```
 
-设置 `work_dir` 后：
+数组模式没有唯一默认根目录，因此每个命令请求都必须提供位于允许目录内的绝对 `cwd`，上传和下载也必须使用绝对路径。
 
-- 当值为字符串时，未传 `cwd` 的命令默认在该目录运行；相对 `cwd` 和文件传输路径也以该目录为基准。
-- 当值为数组时，每个命令请求都必须显式传入 `cwd`，且 `cwd` 必须位于数组中的任一目录内。因为没有唯一的默认根目录，上传和下载必须使用绝对路径。
-- 命令的 `cwd`、上传目标和下载源必须位于该目录内。绝对路径仍可使用，但不能越界。
-- 字符串模式下，上传和下载可直接传相对于 `work_dir` 的路径。
-- 路径会经过规范化和目录边界检查。Windows 上会在操作期间锁定规范化路径的各级目录，拒绝残留的重解析点，并根据实际打开的文件句柄复核下载源，防止通过并发替换符号链接或目录联接越界。
-- 多行命令所需的临时脚本也会创建在允许的工作目录内。
+Windows 上，LCR 会规范化路径、拒绝残留的重解析点，并在操作期间保持目录句柄；下载时还会根据已打开的文件句柄复核源路径，以降低通过符号链接、目录联接或并发替换越界的风险。
 
-设置非空 `command_allowlist` 后，`command`（或直接执行请求中的 `program`）必须至少匹配一条规则。普通字符串采用“以该字符串开头”的匹配方式；以 `/` 开头并以 `/` 结尾的值视为正则表达式。正则按 UTF-8 字节匹配，支持 ASCII 字符类和 ASCII 大小写匹配；`.*` 等表达式仍可覆盖 Unicode 参数，但不支持 Unicode 属性、Unicode 字符类或 Unicode 大小写折叠。使用不受支持的表达式会导致配置加载失败。空数组或省略该字段表示不限制命令。
+> [!IMPORTANT]
+> `work_dir` 是 LCR 的请求策略，不是 Windows 进程沙箱。获准执行的程序仍可按当前用户权限访问其他路径。需要强隔离时，请配合独立低权限账户、ACL 或系统级沙箱。
 
-直接执行 `program` 时，匹配文本由程序名及所有参数组成，参数使用 JSON 字符串形式加引号。例如 `{"program":"git.exe","args":["status"]}` 的匹配文本是 `git.exe "status"`。当同时启用了 `work_dir` 和白名单时，纯文件名形式的 `.cmd` 或 `.bat` 会在已验证的 `cwd` 中查找并以其绝对路径启动；因此可用 `"WimBuilder.cmd"` 这类规则放行工作目录中的同名批处理文件。带目录的相对路径、绝对路径和其他程序仍按请求原文匹配。白名单启用时不允许使用自定义绝对 `interpreter`，避免解释器本身绕过命令规则；仍可使用内置的 `cmd` 或 `pwsh`。
+### 限制可执行程序
 
-命令因白名单或工作目录策略被拒绝时，`/exec`、`/exec/stream` 和 `/spawn` 均返回 HTTP `403 Forbidden`，响应 JSON 的 `msg` 字段包含具体原因。
+`command_allowlist` 非空时，执行接口进入严格白名单模式：
 
-> `work_dir` 限制的是 LCR 自身接受的工作目录、临时脚本和文件传输路径，并不是 Windows 进程沙箱。获准执行的命令仍拥有启动 LCR 的用户权限，可以自行访问其他路径。因此白名单应尽量具体，强隔离场景还应使用独立低权限账户、ACL 或系统级沙箱。
+- 只接受 `program` + `args`，拒绝 `command`。
+- 拒绝 CMD、PowerShell、Python、Node 等命令或脚本解释器，避免通过解释器绕过规则。
+- 匹配文本由程序名和全部参数组成；参数按 JSON 字符串格式加引号。
+- 普通规则执行忽略大小写的前缀匹配，`/…/` 规则执行忽略大小写的正则匹配。
+- 被策略拒绝的 `/exec`、`/exec/stream` 和 `/spawn` 请求返回 HTTP `403 Forbidden`。
 
-> 服务目前不包含身份认证。请仅在可信网络中使用，或通过防火墙、反向代理等方式限制访问。
-
-## 从源码构建
-
-需要在 Windows 上安装稳定版 Rust 工具链：
-
-```powershell
-cargo build -r
-```
-
-发布构建针对单文件体积启用了尺寸优化、LTO、符号剥离和 panic abort，因此链接耗时会比默认 release 配置更长。
-
-构建产物位于：
-
-```text
-target\release\lcr.exe
-```
-
-## API
-
-所有接口均使用 `POST` 方法。
-
-| 接口 | 说明 | 请求类型 |
-| --- | --- | --- |
-| `/exec` | 执行命令并一次性返回结果 | JSON |
-| `/exec/stream` | 执行命令并持续返回输出 | JSON |
-| `/spawn` | 异步启动命令，立即返回会话 ID 和 PID | JSON |
-| `/spawn/result` | 查询异步命令的状态和输出 | JSON |
-| `/spawn/terminate` | 终止异步命令并返回最终结果 | JSON |
-| `/screenshot` | 截取主屏幕并返回 PNG | 空请求体 |
-| `/windows` | 枚举当前桌面的顶级窗口 | 空请求体 |
-| `/control` | 聚焦窗口或模拟键盘、鼠标输入 | JSON |
-| `/download` | 下载指定文件 | JSON |
-| `/upload` | 上传文件到指定路径 | 二进制 |
-
-### 执行命令
-
-请求示例：
-
-```powershell
-curl -X POST http://127.0.0.1:9527/exec `
-  -H "Content-Type: application/json" `
-  --data-raw '{"command":"tasklist","cwd":"D:\\Desktop","timeout":300000,"interpreter":"cmd","script_mode":"auto","output_encoding":"utf8"}'
-```
-
-字段说明：
-
-| 字段 | 必填 | 说明 |
-| --- | --- | --- |
-| `command` | 二选一 | 交给所选解释器执行的脚本或命令；不能与 `program` 同时使用 |
-| `program` | 二选一 | 直接启动的程序名或 Windows 绝对路径；用于可靠传递 Unicode 路径和参数 |
-| `args` | 否 | `program` 的参数数组，默认空数组 |
-| `cwd` | 否 | 命令的工作目录 |
-| `timeout` | 否 | 超时时间，单位为毫秒，默认 300000（5 分钟） |
-| `interpreter` | 否 | 脚本解释器，默认为 `cmd`；可设为 `cmd`、`pwsh` 或解释器的 Windows 绝对路径 |
-| `script_mode` | 否 | 脚本执行方式，可设为 `auto`、`inline` 或 `file`，默认为 `auto` |
-| `detached` | 否 | 是否允许包装脚本正常退出后其子进程继续运行，默认为 `false` |
-| `require_admin` | 否 | 配置启用 `allow_elevation` 后，设为 `true` 会显示 UAC 并通过提升权限辅助进程执行；默认 `false` |
-| `output_encoding` | 否 | stdout/stderr 的编码，可设为 `utf8`、`oem` 或 `ansi`，默认为 `utf8` |
-
-解释器的调用方式如下：
-
-- `cmd`：通过 `cmd.exe /d /s /c` 执行，并将代码页切换为 UTF-8。
-- `pwsh`：通过 `pwsh.exe -NoLogo -NoProfile -NonInteractive -Command` 执行，需要系统已安装 PowerShell 7。
-- 绝对路径：若文件名为 `cmd.exe`、`pwsh.exe` 或 `powershell.exe`，使用对应参数；其他解释器通过 `<绝对路径> -c <command>` 执行。
-
-例如使用指定位置的 Python：
+例如以下请求的匹配文本为 `git.exe "status"`：
 
 ```json
 {
-  "command": "print('hello')",
-  "interpreter": "C:\\Python313\\python.exe"
+  "program": "git.exe",
+  "args": ["status"]
 }
 ```
 
-相对路径不受支持。绝对路径中包含空格时无需额外添加引号。
+正则按 UTF-8 字节匹配，仅支持 ASCII 字符类和 ASCII 大小写匹配；`.*` 可覆盖 Unicode 参数，但 Unicode 属性、Unicode 字符类和 Unicode 大小写折叠不受支持。
 
-#### 直接启动程序
-
-当路径或参数包含中文等 Unicode 字符时，优先使用 `program` 和 `args`，避免经过 `cmd.exe` 的代码页和引号解析：
-
-```json
-{
-  "program": "X:\\Windows\\System32\\notepad.exe",
-  "args": ["C:\\资料\\说明.txt"]
-}
-```
-
-`program` 与 `command`、`interpreter` 互斥。参数会直接通过 Windows 宽字符进程 API 传递。
-
-若同时设置了 `work_dir` 和非空 `command_allowlist`，可直接运行工作目录中的批处理文件，无需将目录加入 `PATH`：
+同时设置 `work_dir` 后，可以按文件名运行已验证 `cwd` 中的 `.cmd` 或 `.bat` 文件：
 
 ```toml
-work_dir = 'C:\\Projects\\WimBuilder'
-command_allowlist = ['WimBuilder.cmd']
+work_dir = "C:\\Projects\\WimBuilder"
+command_allowlist = ["WimBuilder.cmd"]
 ```
 
 ```json
@@ -188,9 +185,9 @@ command_allowlist = ['WimBuilder.cmd']
 }
 ```
 
-LCR 会先以 `WimBuilder.cmd "build"` 检查白名单，再只在该请求的已验证 `cwd` 中解析这个文件名。`.bat` 同样适用。
+### 管理员权限
 
-若脚本会自行请求 UAC 提权，建议由调用方显式要求管理员权限，避免未提升的 LCR 启动脚本后出现无报错的空操作：
+请求中的 `require_admin: true` 只有在服务端显式配置 `allow_elevation = true` 后才生效。LCR 未提升运行时会显示 UAC 确认框，并由提升权限的辅助进程执行命令。
 
 ```json
 {
@@ -199,21 +196,77 @@ LCR 会先以 `WimBuilder.cmd "build"` 检查白名单，再只在该请求的�
 }
 ```
 
-服务端还必须显式配置 `allow_elevation = true`；默认值为 `false`，以避免未认证网络请求反复触发 UAC。LCR 未提升时会显示 Windows UAC 确认框；确认后由新的提升权限 LCR 进程执行，取消则在接口结果中返回 `administrator elevation was cancelled`。同一时间只允许一个待确认的 UAC 提示；用户确认前 `/spawn` 还没有可返回的会话。辅助进程确认目标已加入 Job Object 后才报告启动，超时和 `/spawn/terminate` 通过辅助进程终止提升后的进程树。提升执行的 stdout/stderr 各最多缓冲 8 MiB；`/exec/stream` 的输出会在提升权限辅助进程结束后回传。LCR 无法可靠判断任意批处理是否会在运行期间自行请求 UAC 提权，因此该字段需要由已知有此要求的调用方设置。
+同一时间只允许一个待确认的 UAC 请求。用户取消时接口返回 `administrator elevation was cancelled`。提升执行仍受超时和进程树终止策略约束；stdout 和 stderr 各最多缓冲 8 MiB，`/exec/stream` 会在提升权限的辅助进程结束后统一回传输出。
+
+## API 参考
+
+所有接口均使用 `POST`。
+
+| 接口 | 说明 | 请求体 | 成功响应 |
+| --- | --- | --- | --- |
+| `/exec` | 执行命令并等待完成 | JSON | JSON |
+| `/exec/stream` | 流式执行命令 | JSON | NDJSON |
+| `/spawn` | 异步启动命令 | JSON | JSON |
+| `/spawn/result` | 查询异步任务及新增输出 | JSON | JSON |
+| `/spawn/terminate` | 终止异步任务及其进程树 | JSON | JSON |
+| `/screenshot` | 截取主屏幕 | 空 | PNG |
+| `/windows` | 枚举顶级窗口 | 空 | JSON |
+| `/control` | 聚焦窗口或模拟键鼠输入 | JSON | JSON |
+| `/download` | 下载文件 | JSON | 二进制 |
+| `/upload` | 上传文件 | 二进制 | JSON |
+
+### 执行请求
+
+`/exec`、`/exec/stream` 和 `/spawn` 使用相同的请求结构。
+
+| 字段 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `command` | 二选一 | — | 交给解释器执行的命令或脚本；不能与 `program` 同时使用 |
+| `program` | 二选一 | — | 直接启动的程序名或 Windows 绝对路径 |
+| `args` | 否 | `[]` | `program` 的参数数组 |
+| `cwd` | 否 | 服务进程目录或配置的默认目录 | 命令工作目录 |
+| `timeout` | 否 | `300000` | 超时时间，单位为毫秒 |
+| `interpreter` | 否 | `cmd` | `cmd`、`pwsh` 或解释器的 Windows 绝对路径 |
+| `script_mode` | 否 | `auto` | `auto`、`inline` 或 `file` |
+| `detached` | 否 | `false` | 包装脚本退出后是否允许子进程继续运行 |
+| `require_admin` | 否 | `false` | 请求通过 UAC 提升权限 |
+| `output_encoding` | 否 | `utf8` | `utf8`、`oem` 或 `ansi` |
+
+路径或参数包含 Unicode 字符时，优先使用 `program` 和 `args`，避免经过命令解释器的代码页和引号解析：
+
+```json
+{
+  "program": "X:\\Windows\\System32\\notepad.exe",
+  "args": ["C:\\资料\\说明.txt"]
+}
+```
+
+使用 `command` 时，解释器调用方式如下：
+
+- `cmd`：通过 `cmd.exe /d /s /c` 执行，并将代码页切换为 UTF-8。
+- `pwsh`：通过 `pwsh.exe -NoLogo -NoProfile -NonInteractive -Command` 执行，需要 PowerShell 7。
+- 绝对路径：`cmd.exe`、`pwsh.exe` 和 `powershell.exe` 使用各自参数，其他解释器通过 `<绝对路径> -c <command>` 执行。
+
+自定义解释器必须使用绝对路径，路径包含空格时无需额外加引号：
+
+```json
+{
+  "command": "print('hello')",
+  "interpreter": "C:\\Python313\\python.exe"
+}
+```
 
 #### 输出编码
 
-默认的 `utf8` 适合在 UTF-8 代码页下运行的命令。传统程序仍按系统代码页输出时，可将 `output_encoding` 指定为 `oem`（`GetOEMCP`）或 `ansi`（`GetACP`）。流式接口会保留跨数据块的多字节字符。
+默认的 `utf8` 适用于 UTF-8 输出。传统程序按系统代码页输出时，可选择 `oem`（`GetOEMCP`）或 `ansi`（`GetACP`）。流式接口会保留跨数据块的多字节字符。
 
 #### 多行脚本
 
-`script_mode` 控制命令是直接传给解释器，还是先写入临时脚本文件：
+`script_mode` 控制脚本如何交给解释器：
 
-- `auto`：检测到 `command` 中包含换行符时使用临时文件，否则直接执行。
+- `auto`：包含换行符时使用临时文件，否则直接执行。
 - `inline`：始终直接传给解释器。
 - `file`：始终写入临时文件后执行。
-
-例如执行多行 CMD 脚本：
 
 ```json
 {
@@ -223,11 +276,21 @@ LCR 会先以 `WimBuilder.cmd "build"` 检查白名单，再只在该请求的�
 }
 ```
 
-CMD 临时脚本使用 `.cmd` 扩展名并切换至 UTF-8 代码页，PowerShell 临时脚本使用带 UTF-8 BOM 的 `.ps1` 文件，其他解释器使用通用脚本文件。临时文件会在执行结束、超时或启动失败后自动删除。
+临时脚本会在命令结束、超时或启动失败后删除。CMD 脚本使用 `.cmd` 和 UTF-8 代码页，PowerShell 脚本使用带 UTF-8 BOM 的 `.ps1`。
 
-`detached: true` 适用于由 CMD 或 PowerShell 包装脚本启动 GUI 程序的场景。为了避免 GUI 子进程继承输出管道并阻止包装脚本会话结束，detached 模式会将 stdout/stderr 重定向到空设备，因此响应中的两个输出字段为空。包装脚本仍会被加入 Job Object，所以在包装脚本运行期间，超时和 `/spawn/terminate` 仍会终止其进程树；包装脚本正常结束、会话进入 `exited` 后，已经启动的子进程不会因为 LCR 自己的 Job Object 关闭而被结束，也不再由该会话跟踪或终止。如果 LCR 本身位于外层 Job Object 中，则仅在外层明确允许 breakaway 时请求脱离；否则子进程继续继承外层 Job，因而仍可能在服务管理器或 CI runner 结束外层 Job 时被终止。默认值 `false` 保持输出捕获和严格的进程树清理行为。
+#### Detached 模式
 
-响应示例：
+`detached: true` 适用于包装脚本启动 GUI 程序的场景。该模式将 stdout 和 stderr 重定向到空设备，因此响应中的输出为空。包装脚本运行期间仍受超时和进程树终止控制；包装脚本正常退出后，其子进程不再由该会话跟踪。
+
+如果 LCR 本身位于外层 Job Object，子进程能否脱离还取决于外层是否允许 breakaway。默认的 `false` 会保留输出捕获和严格的进程树清理行为。
+
+### 同步执行：`/exec`
+
+```powershell
+curl -X POST http://127.0.0.1:9527/exec `
+  -H "Content-Type: application/json" `
+  --data-raw '{"command":"tasklist","timeout":300000,"output_encoding":"utf8"}'
+```
 
 ```json
 {
@@ -240,17 +303,15 @@ CMD 临时脚本使用 `.cmd` 扩展名并切换至 UTF-8 代码页，PowerShell
 }
 ```
 
-### 流式执行命令
+### 流式执行：`/exec/stream`
 
-`POST /exec/stream` 的请求体与 `/exec` 相同。响应使用 HTTP Chunked 传输，内容类型为 NDJSON，每行是一个独立事件：
+响应使用 HTTP Chunked 传输，内容类型为 NDJSON，每行是一个独立事件：
 
 ```powershell
 curl --no-buffer -X POST http://127.0.0.1:9527/exec/stream `
   -H "Content-Type: application/json" `
-  --data-raw '{"command":"ping 127.0.0.1 -n 4","interpreter":"cmd"}'
+  --data-raw '{"command":"ping 127.0.0.1 -n 4"}'
 ```
-
-响应示例：
 
 ```jsonl
 {"type":"stdout","data":"hello\r\n"}
@@ -258,25 +319,17 @@ curl --no-buffer -X POST http://127.0.0.1:9527/exec/stream `
 {"type":"exit","exit_code":0}
 ```
 
-命令超时时，最后一个事件为：
+超时时最后一个事件为 `{"type":"timeout","timeout":300000}`；启动失败时返回 `error` 事件。
 
-```json
-{"type":"timeout","timeout":300000}
-```
+### 异步执行：`/spawn`
 
-命令无法启动时会返回 `error` 事件。
-
-### 异步执行命令
-
-`POST /spawn` 的请求体与 `/exec` 相同。命令成功启动后立即返回 `202 Accepted`，不会等待命令执行完成：
+`/spawn` 成功启动命令后立即返回 `202 Accepted`：
 
 ```powershell
 curl -X POST http://127.0.0.1:9527/spawn `
   -H "Content-Type: application/json" `
-  --data-raw '{"command":"ping 127.0.0.1 -n 10","interpreter":"cmd"}'
+  --data-raw '{"command":"ping 127.0.0.1 -n 10"}'
 ```
-
-响应示例：
 
 ```json
 {
@@ -286,15 +339,13 @@ curl -X POST http://127.0.0.1:9527/spawn `
 }
 ```
 
-使用 `POST /spawn/result` 查询运行状态和当前已经收集到的输出：
+使用 `/spawn/result` 查询状态。轮询时传回上一次响应中的 `stdout_next_offset` 和 `stderr_next_offset`，即可只获取新增输出：
 
 ```powershell
 curl -X POST http://127.0.0.1:9527/spawn/result `
   -H "Content-Type: application/json" `
   --data-raw '{"session_id":"1234-1","stdout_offset":0,"stderr_offset":0}'
 ```
-
-响应示例：
 
 ```json
 {
@@ -316,11 +367,16 @@ curl -X POST http://127.0.0.1:9527/spawn/result `
 }
 ```
 
-状态可能为 `starting`、`running`、`terminating`、`terminated`、`exited`、`timed_out` 或 `failed`。`stdout_offset` 和 `stderr_offset` 是可选的 UTF-8 字节偏移量，默认为 0；持续轮询时将上次返回的 `*_next_offset` 传入，即可只获取新增输出。每个流单次最多返回 1 MiB；若 `*_complete` 为 `false`，继续使用新的 `*_next_offset` 查询剩余内容。
+状态可能为 `starting`、`running`、`terminating`、`terminated`、`exited`、`timed_out` 或 `failed`。
 
-每个 stdout/stderr 最多保留 8 MiB，所有异步会话合计最多保留 64 MiB；超过限制时对应的 `*_truncated` 为 `true`。完成的会话通常保留 30 分钟，服务同时最多保存 128 个会话；达到会话上限时会优先淘汰最早完成的结果，只有 128 个会话都仍在运行时才拒绝新任务。异步命令必须成功加入 Job Object 才会报告启动成功，服务退出或命令超时时会终止对应进程树。
+异步会话限制：
 
-使用 `POST /spawn/terminate` 主动终止异步任务。请求字段与 `/spawn/result` 相同，至少提供 `session_id`：
+- 每个 stdout/stderr 最多保留 8 MiB，所有会话合计最多保留 64 MiB。
+- 单次查询每个输出流最多返回 1 MiB；`*_complete` 为 `false` 时应继续查询。
+- 已完成会话通常保留 30 分钟，最多保存 128 个会话。
+- 达到上限时优先淘汰最早完成的会话；128 个会话均在运行时拒绝新任务。
+
+使用 `/spawn/terminate` 终止任务及其 Job Object 进程树：
 
 ```powershell
 curl -X POST http://127.0.0.1:9527/spawn/terminate `
@@ -328,20 +384,21 @@ curl -X POST http://127.0.0.1:9527/spawn/terminate `
   --data-raw '{"session_id":"1234-1"}'
 ```
 
-接口会终止该任务的 Job Object 进程树，等待状态收敛后返回与 `/spawn/result` 相同的结果结构。主动结束的任务状态为 `terminated`、`exit_code` 为 `null`。对已经结束的任务重复调用时不会改变结果，会直接返回现有最终状态。
+响应结构与 `/spawn/result` 相同。主动终止后的状态为 `terminated`，`exit_code` 为 `null`；重复终止已结束的任务不会改变结果。
 
-### 截取屏幕
+### 截取屏幕：`/screenshot`
 
-`POST /screenshot` 截取当前主屏幕，直接返回 `image/png` 二进制数据。
+截取当前主屏幕并直接返回 `image/png`：
 
 ```powershell
-curl -X POST http://127.0.0.1:9527/screenshot `
-  --output screenshot.png
+curl -X POST http://127.0.0.1:9527/screenshot --output screenshot.png
 ```
 
-### 枚举窗口
+### 枚举窗口：`/windows`
 
-`POST /windows` 返回当前输入桌面上的窗口信息：
+```powershell
+curl -X POST http://127.0.0.1:9527/windows
+```
 
 ```json
 {
@@ -372,17 +429,11 @@ curl -X POST http://127.0.0.1:9527/screenshot `
 }
 ```
 
-`hwnd` 使用十六进制字符串表示，避免客户端语言的整数精度问题。
+`hwnd` 使用十六进制字符串表示，以避免客户端语言的整数精度问题。
 
-请求示例：
+### 控制窗口与输入：`/control`
 
-```powershell
-curl -X POST http://127.0.0.1:9527/windows
-```
-
-### 控制窗口和输入
-
-`POST /control` 在当前输入桌面按数组顺序执行操作。同一时间只执行一个控制请求，以避免不同请求的键鼠动作交错。相邻动作之间默认等待 50 毫秒，减少聚焦后紧接着输入时被 Windows 丢弃的概率；可通过顶层 `delay` 字段配置毫秒数，设为 0 可关闭等待，单次间隔最大为 5000，整个请求的累计动作间延迟不得超过 30000 毫秒：
+操作按数组顺序执行。同一时间只处理一个控制请求，避免不同请求的键鼠动作交错。相邻动作默认间隔 50 毫秒，可通过 `delay` 修改：
 
 ```json
 {
@@ -398,37 +449,28 @@ curl -X POST http://127.0.0.1:9527/windows
 }
 ```
 
-请求示例：
-
-```powershell
-curl -X POST http://127.0.0.1:9527/control `
-  -H "Content-Type: application/json" `
-  --data-raw '{"delay":100,"actions":[{"type":"focus_window","hwnd":"0xA12BC"},{"type":"keyboard","key":"G"},{"type":"text","text":"hello 世界"},{"type":"mouse_move","x":500,"y":300},{"type":"mouse_click","button":"left"},{"type":"mouse_wheel","delta":-120}]}'
-```
-
-`delay_ms` 可作为 `delay` 的兼容别名。延迟只发生在两个动作之间，单个动作或最后一个动作后不会额外等待。
-
-支持的操作：
-
 | `type` | 字段 | 说明 |
 | --- | --- | --- |
 | `focus_window` | `hwnd` | 聚焦窗口；接受十六进制字符串、十进制字符串或整数 |
-| `keyboard` | `key`, `state` | 按键操作；`state` 可为 `down`、`up`、`press`，默认 `press` |
+| `keyboard` | `key`, `state` | 按键；`state` 为 `down`、`up` 或 `press`，默认 `press` |
 | `text` | `text` | 使用 Unicode 键盘事件输入文本 |
 | `mouse_move` | `x`, `y` | 移动到主屏幕绝对坐标 |
 | `mouse_button` | `button`, `state` | 鼠标按键操作 |
-| `mouse_click` | `button` | 单击，`button` 默认为 `left` |
+| `mouse_click` | `button` | 单击；默认 `left` |
 | `mouse_wheel` | `delta` | 滚轮增量，通常以正负 120 为一格 |
 
-`button` 可为 `left`、`right` 或 `middle`。`keyboard.key` 支持单个 ASCII 字母/数字、`F1`–`F24`、十六进制虚拟键码，以及 `enter`、`tab`、`escape`、`space`、`backspace`、`ctrl`、`shift`、`alt`、`win`、方向键、`home`、`end`、`pageup`、`pagedown`、`insert` 和 `delete`。
+`button` 支持 `left`、`right` 和 `middle`。`keyboard.key` 支持单个 ASCII 字母或数字、`F1`–`F24`、十六进制虚拟键码，以及常用的控制键、方向键和导航键。
 
-Windows 可能拒绝后台进程强制聚焦某些窗口，也可能因为权限级别阻止输入注入。发生失败时接口返回 `409 Conflict`，响应包含失败动作的索引和已完成动作数量；此前已经成功执行的动作不会回滚。
+限制：
 
-每个请求最多包含 256 个动作，单个 `text` 动作最多包含 4096 个 UTF-16 代码单元。
+- 每个请求最多 256 个动作。
+- 单个 `text` 最多 4096 个 UTF-16 代码单元。
+- 单次动作间隔最大 5000 毫秒，累计间隔不超过 30000 毫秒。
+- `delay_ms` 是 `delay` 的兼容别名。
 
-### 下载文件
+Windows 可能阻止后台进程聚焦窗口，或因权限级别不同而拒绝输入注入。失败时返回 `409 Conflict`，并包含失败动作索引和已完成动作数量；已执行动作不会回滚。
 
-请求示例：
+### 下载文件：`/download`
 
 ```powershell
 curl -X POST http://127.0.0.1:9527/download `
@@ -437,11 +479,11 @@ curl -X POST http://127.0.0.1:9527/download `
   --output test.7z
 ```
 
-成功后响应体即为文件的二进制内容。
+成功响应的正文即为文件内容。
 
-### 上传文件
+### 上传文件：`/upload`
 
-请求体直接传输文件内容，通过 `X-File-Path` 请求头指定目标路径：
+请求体直接传输文件内容，通过 `X-File-Path` 指定目标路径：
 
 ```powershell
 curl -X POST http://127.0.0.1:9527/upload `
@@ -450,9 +492,7 @@ curl -X POST http://127.0.0.1:9527/upload `
   --data-binary "@D:\Download\source.7z"
 ```
 
-上传过程采用流式写入，不会将整个文件加载到内存。目标文件已存在时返回 `409 Conflict`，不会覆盖原文件。提交文件时优先使用硬链接；对于不支持硬链接的 WinPE RAM 磁盘，会自动回退到不覆盖目标的文件复制。
-
-成功响应示例：
+上传采用流式写入，不会将整个文件加载到内存。目标已存在时返回 `409 Conflict`，不会覆盖原文件。提交时优先使用硬链接；在不支持硬链接的 WinPE RAM 磁盘上自动回退到不覆盖目标的文件复制。
 
 ```json
 {
@@ -461,3 +501,27 @@ curl -X POST http://127.0.0.1:9527/upload `
   "bytes": 123456
 }
 ```
+
+## 从源码构建
+
+需要 Windows 和稳定版 Rust 工具链。
+
+```powershell
+cargo build --release
+```
+
+产物位于 `target\release\lcr.exe`。Release 配置针对单文件体积启用了尺寸优化、LTO、符号剥离和 panic abort，因此链接时间会长于普通开发构建。
+
+提交更改前请运行：
+
+```powershell
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+端到端测试脚本位于 [`tests/e2e.ps1`](./tests/e2e.ps1)。
+
+## 项目定位
+
+LCR 刻意保持简单：它是面向受控 Windows 环境的轻量级远程操作入口，不是通用远程管理平台，也不是安全沙箱。如果场景需要公网暴露、多租户、细粒度身份授权或强隔离，请在 LCR 之外增加相应的认证、网络和系统安全边界。
