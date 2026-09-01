@@ -3,6 +3,7 @@ use regex::bytes::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::{
     fs::{self, File},
+    net::SocketAddr,
     path::{Component, Path, PathBuf},
 };
 
@@ -57,6 +58,7 @@ pub struct GuardedDownload {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
+    listen: Option<SocketAddr>,
     work_dir: Option<WorkDirConfig>,
     #[serde(default)]
     command_allowlist: Vec<String>,
@@ -79,6 +81,7 @@ enum CommandRule {
 
 #[derive(Debug, Default)]
 pub struct RuntimePolicy {
+    listen: Option<SocketAddr>,
     work_dirs: Vec<PathBuf>,
     default_work_dir: Option<PathBuf>,
     command_allowlist: Vec<CommandRule>,
@@ -154,11 +157,16 @@ impl RuntimePolicy {
             .map(parse_command_rule)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
+            listen: config.listen,
             work_dirs,
             default_work_dir,
             command_allowlist,
             allow_elevation: config.allow_elevation,
         })
+    }
+
+    pub(crate) fn listen(&self) -> Option<SocketAddr> {
+        self.listen
     }
 
     pub fn prepare_exec(&self, request: &mut ExecRequest) -> Result<(), String> {
@@ -660,6 +668,7 @@ mod tests {
     fn configured_paths_cannot_escape_the_root() {
         let root = fs::canonicalize(".").unwrap();
         let policy = RuntimePolicy {
+            listen: None,
             work_dirs: vec![root.clone()],
             default_work_dir: Some(root.clone()),
             command_allowlist: Vec::new(),
@@ -685,6 +694,7 @@ mod tests {
         let file = nested.join("file.bin");
         fs::write(&file, b"test").unwrap();
         let policy = RuntimePolicy {
+            listen: None,
             work_dirs: vec![fs::canonicalize(&root).unwrap()],
             default_work_dir: Some(fs::canonicalize(&root).unwrap()),
             command_allowlist: Vec::new(),
@@ -785,6 +795,7 @@ mod tests {
         let root = fs::canonicalize(".").unwrap();
         let other = fs::canonicalize(std::env::temp_dir()).unwrap();
         let policy = RuntimePolicy {
+            listen: None,
             work_dirs: vec![root.clone(), other.clone()],
             default_work_dir: None,
             command_allowlist: Vec::new(),
@@ -814,6 +825,14 @@ mod tests {
     #[test]
     fn repository_example_is_valid_toml() {
         let _: FileConfig = toml::from_str(include_str!("../lcr.toml.example")).unwrap();
+    }
+
+    #[test]
+    fn loads_a_configured_listen_address() {
+        let policy =
+            RuntimePolicy::parse_config(Path::new("lcr.toml"), "listen = '192.0.2.1:8080'")
+                .unwrap();
+        assert_eq!(policy.listen(), Some("192.0.2.1:8080".parse().unwrap()));
     }
 
     #[test]
@@ -869,6 +888,7 @@ mod tests {
     #[test]
     fn direct_program_arguments_participate_in_allowlist_matching() {
         let policy = RuntimePolicy {
+            listen: None,
             work_dirs: Vec::new(),
             default_work_dir: None,
             command_allowlist: vec![
@@ -907,6 +927,7 @@ mod tests {
         fs::write(&batch, "@echo off\r\n").unwrap();
         let root = fs::canonicalize(&root).unwrap();
         let policy = RuntimePolicy {
+            listen: None,
             work_dirs: vec![root.clone()],
             default_work_dir: Some(root.clone()),
             command_allowlist: vec![parse_command_rule("WimBuilder.cmd".to_string()).unwrap()],
@@ -938,6 +959,7 @@ mod tests {
     #[test]
     fn elevated_allowlist_rejects_an_unresolved_bare_executable() {
         let policy = RuntimePolicy {
+            listen: None,
             work_dirs: Vec::new(),
             default_work_dir: None,
             command_allowlist: vec![parse_command_rule("git.exe".to_string()).unwrap()],
@@ -956,6 +978,7 @@ mod tests {
     #[test]
     fn allowlist_disables_command_requests() {
         let policy = RuntimePolicy {
+            listen: None,
             work_dirs: Vec::new(),
             default_work_dir: None,
             command_allowlist: vec![parse_command_rule("echo ".to_string()).unwrap()],
@@ -973,6 +996,7 @@ mod tests {
     #[test]
     fn allowlist_rejects_direct_command_interpreters() {
         let policy = RuntimePolicy {
+            listen: None,
             work_dirs: Vec::new(),
             default_work_dir: None,
             command_allowlist: vec![parse_command_rule("/".to_string()).unwrap()],

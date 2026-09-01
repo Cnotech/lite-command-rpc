@@ -115,7 +115,7 @@ try {
 
     $helpCommandOutput = (& $binary help | Out-String)
     Assert-True ($LASTEXITCODE -eq 0) "help command should exit successfully"
-    Assert-True ($helpCommandOutput.Contains("0.0.0.0:9527")) "help command should describe the listener"
+    Assert-True ($helpCommandOutput.Contains("127.0.0.1:9527")) "help command should describe the listener"
     Complete-E2ECase
 
     Start-E2ECase "Server startup with custom listen address"
@@ -660,10 +660,11 @@ try {
     @"
 work_dir = '$cwdConfigRoot'
 command_allowlist = ['where.exe ']
+listen = '$cwdConfigAddress'
 "@ | Set-Content -LiteralPath (Join-Path $cwdConfigDirectory "lcr.toml") -Encoding utf8
     $cwdConfigServer = Start-Process `
         -FilePath $binary `
-        -ArgumentList @("serve", "--listen", $cwdConfigAddress) `
+        -ArgumentList @("serve") `
         -WorkingDirectory $cwdConfigDirectory `
         -PassThru `
         -RedirectStandardOutput $cwdConfigStdout `
@@ -690,6 +691,11 @@ command_allowlist = ['where.exe ']
     Start-E2ECase "Config work directory and command allowlist"
     $configPort = Get-FreeTcpPort
     $configAddress = "${listenHost}:$configPort"
+    $configuredListenPort = Get-FreeTcpPort
+    while ($configuredListenPort -eq $configPort) {
+        $configuredListenPort = Get-FreeTcpPort
+    }
+    $configuredListenAddress = "${listenHost}:$configuredListenPort"
     $configRoot = Join-Path $testRoot "config-root"
     $configFile = Join-Path $testRoot "lcr.test.toml"
     $configStdout = Join-Path $testRoot "config-server.stdout.log"
@@ -701,6 +707,7 @@ command_allowlist = ['where.exe ']
     @"
 work_dir = '$configRoot'
 command_allowlist = ['where.exe ', 'cmd.exe ', 'allowlisted.cmd']
+listen = '$configuredListenAddress'
 "@ | Set-Content -LiteralPath $configFile -Encoding utf8
     $configServer = Start-Process `
         -FilePath $binary `

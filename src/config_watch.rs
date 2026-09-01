@@ -14,7 +14,7 @@ const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy)]
 pub(crate) struct WorkerOptions {
-    pub listen: SocketAddr,
+    pub listen: Option<SocketAddr>,
     pub log_level: logger::Level,
 }
 
@@ -97,11 +97,11 @@ pub(crate) fn supervise(config_path: &Path, options: WorkerOptions) -> ExitCode 
 fn start_worker(config_path: &Path, options: WorkerOptions) -> io::Result<WorkerProcess> {
     let executable = std::env::current_exe()?;
     let mut command = Command::new(executable);
+    command.arg("--config").arg(config_path);
+    if let Some(listen) = options.listen {
+        command.arg("--listen").arg(listen.to_string());
+    }
     command
-        .arg("--config")
-        .arg(config_path)
-        .arg("--listen")
-        .arg(options.listen.to_string())
         .arg("--log-level")
         .arg(options.log_level.to_string())
         .arg("--config-watch-worker")
@@ -153,10 +153,10 @@ mod tests {
     #[test]
     fn worker_options_copy_connection_settings() {
         let options = WorkerOptions {
-            listen: "127.0.0.1:9527".parse().unwrap(),
+            listen: Some("127.0.0.1:9527".parse().unwrap()),
             log_level: logger::Level::Debug,
         };
-        assert_eq!(options.listen.port(), 9527);
+        assert_eq!(options.listen.unwrap().port(), 9527);
         assert_eq!(options.log_level.to_string(), "debug");
     }
 }

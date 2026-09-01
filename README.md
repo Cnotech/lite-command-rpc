@@ -43,7 +43,7 @@ LCR 以单个 `lcr.exe` 运行，无额外运行时依赖，支持同步、流�
 .\lcr.exe --listen 127.0.0.1:9527
 ```
 
-`lcr.exe serve` 与不带子命令启动的行为相同。若不指定 `--listen`，服务默认监听 `0.0.0.0:9527`。
+`lcr.exe serve` 与不带子命令启动的行为相同。若命令行和配置文件均未指定监听地址，服务默认监听 `127.0.0.1:9527`。
 
 ### 3. 发送请求
 
@@ -75,7 +75,7 @@ Commands:
   serve  （可省略）启动 HTTP 服务
 
 Options:
-  --listen <IP:PORT>   监听地址，默认 0.0.0.0:9527
+  --listen <IP:PORT>   监听地址，优先于配置文件（默认 127.0.0.1:9527）
   --config <PATH>      显式指定 TOML 配置文件
   --log-level <LEVEL>  日志级别，默认 info
   -h, --help           显示帮助
@@ -93,6 +93,9 @@ Options:
 建议从仓库中的 [`lcr.toml.example`](./lcr.toml.example) 复制配置，并至少设置 `work_dir` 和 `command_allowlist`：
 
 ```toml
+# 服务监听地址；命令行 --listen 的优先级更高。
+listen = "127.0.0.1:9527"
+
 # 相对路径以 lcr.toml 所在目录为基准，目录必须已经存在。
 work_dir = "workspace"
 
@@ -117,6 +120,8 @@ allow_elevation = false
 3. `lcr.exe` 同目录中的 `lcr.toml`
 
 自动查找时，只有文件不存在才会继续查找下一位置。文件无法读取、字段未知或内容无效时，服务会拒绝启动；两个默认位置都没有配置文件时，则以不受配置策略限制的兼容模式运行。
+
+监听地址的优先级为 `--listen` 命令行参数、配置文件中的 `listen`、内置默认值 `127.0.0.1:9527`。
 
 成功加载配置后，LCR 会监视该文件。修改或原子替换文件时，新配置会先经过验证，再通过重启 HTTP worker 生效。无效配置或文件被删除不会覆盖最后一次有效配置。worker 重启会中断正在处理的 HTTP 请求和非 detached 命令。
 

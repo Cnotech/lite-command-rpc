@@ -21,9 +21,11 @@ use std::{
     thread,
 };
 
+const DEFAULT_LISTEN: &str = "127.0.0.1:9527";
+
 /// Lightweight Windows HTTP service for command execution and file transfer.
 ///
-/// Running without a command starts the server on http://0.0.0.0:9527.
+/// Running without a command starts the server on http://127.0.0.1:9527 by default.
 /// All endpoints use POST and the service has no authentication.
 ///
 /// HTTP endpoints:
@@ -59,14 +61,9 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// Address and port on which the HTTP service listens
-    #[arg(
-        long,
-        global = true,
-        value_name = "IP:PORT",
-        default_value = "0.0.0.0:9527"
-    )]
-    listen: SocketAddr,
+    /// Address and port on which the HTTP service listens; overrides the config file
+    #[arg(long, global = true, value_name = "IP:PORT")]
+    listen: Option<SocketAddr>,
 
     /// Minimum level printed by the logger
     #[arg(
@@ -273,6 +270,11 @@ fn run_server(addr: SocketAddr, policy: Arc<RuntimePolicy>) -> std::io::Result<(
     Ok(())
 }
 
+fn listen_address(cli: Option<SocketAddr>, policy: &RuntimePolicy) -> SocketAddr {
+    cli.or_else(|| policy.listen())
+        .unwrap_or_else(|| DEFAULT_LISTEN.parse().unwrap())
+}
+
 fn main() -> ExitCode {
     if let Err(err) = console::set_title("lcr") {
         logger::warn(format_args!("failed to set console title: {err}"));
@@ -316,9 +318,10 @@ fn main() -> ExitCode {
             },
         );
     }
+    let listen = listen_address(cli.listen, &policy);
     let policy = Arc::new(policy);
     match cli.command {
-        None | Some(CliCommand::Serve) => match run_server(cli.listen, policy) {
+        None | Some(CliCommand::Serve) => match run_server(listen, policy) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 logger::error(format_args!("failed to start lcr: {err}"));
@@ -381,7 +384,11 @@ mod tests {
     fn no_arguments_starts_server() {
         let cli = Cli::try_parse_from(["lcr"]).expect("arguments should be valid");
         assert_eq!(cli.command, None);
-        assert_eq!(cli.listen, "0.0.0.0:9527".parse().unwrap());
+        assert_eq!(cli.listen, None);
+        assert_eq!(
+            listen_address(cli.listen, &RuntimePolicy::default()),
+            "127.0.0.1:9527".parse().unwrap()
+        );
         assert_eq!(cli.log_level, logger::Level::Info);
     }
 
@@ -406,7 +413,7 @@ mod tests {
             vec!["lcr", "serve", "--listen", "127.0.0.1:8080"],
         ] {
             let cli = Cli::try_parse_from(arguments).expect("listen address should be valid");
-            assert_eq!(cli.listen, "127.0.0.1:8080".parse().unwrap());
+            assert_eq!(cli.listen, Some("127.0.0.1:8080".parse().unwrap()));
         }
     }
 
@@ -441,7 +448,7 @@ mod tests {
     fn help_describes_the_http_api() {
         let help = Cli::command().render_long_help().to_string();
         for expected in [
-            "http://0.0.0.0:9527",
+            "http://127.0.0.1:9527",
             "/exec/stream",
             "/spawn/result",
             "/spawn/terminate",
