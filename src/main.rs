@@ -1,4 +1,6 @@
 mod config;
+#[cfg(windows)]
+mod config_watch;
 mod console;
 mod encoding;
 mod http;
@@ -73,6 +75,9 @@ struct Cli {
         default_value_t = logger::Level::Info
     )]
     log_level: logger::Level,
+
+    #[arg(long, global = true, hide = true)]
+    config_watch_worker: bool,
 
     #[command(subcommand)]
     command: Option<CliCommand>,
@@ -269,8 +274,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Some(path) = config_path {
+    if let Some(path) = config_path.as_deref() {
         logger::info(format_args!("loaded config: {}", path.display()));
+    }
+    #[cfg(windows)]
+    if let Some(path) = config_path.as_deref()
+        && !cli.config_watch_worker
+    {
+        return config_watch::supervise(
+            path,
+            config_watch::WorkerOptions {
+                listen: cli.listen,
+                log_level: cli.log_level,
+            },
+        );
     }
     let policy = Arc::new(policy);
     match cli.command {

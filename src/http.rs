@@ -11,6 +11,11 @@ pub fn send_response(
     body: &str,
     content_type: &str,
 ) -> std::io::Result<()> {
+    let content_type = if content_type.eq_ignore_ascii_case("application/json") {
+        "application/json; charset=utf-8"
+    } else {
+        content_type
+    };
     let headers = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: {content_type}\r\n\

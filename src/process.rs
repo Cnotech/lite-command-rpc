@@ -131,20 +131,24 @@ fn send_pipe_data(sender: &mpsc::Sender<OutputMessage>, stdout: bool, data: Vec<
 }
 
 #[cfg(windows)]
-struct ProcessJob {
+pub(crate) struct ProcessJob {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
 #[cfg(windows)]
 impl ProcessJob {
-    fn assign(child: &Child, kill_on_close: bool) -> std::io::Result<Self> {
+    pub(crate) fn assign(
+        child: &Child,
+        kill_on_close: bool,
+        allow_breakaway: bool,
+    ) -> std::io::Result<Self> {
         use std::{mem::zeroed, os::windows::io::AsRawHandle};
         use windows_sys::Win32::{
             Foundation::{CloseHandle, HANDLE},
             System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                SetInformationJobObject,
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JobObjectExtendedLimitInformation, SetInformationJobObject,
             },
         };
 
@@ -153,9 +157,17 @@ impl ProcessJob {
             if handle.is_null() {
                 return Err(std::io::Error::last_os_error());
             }
-            if kill_on_close {
+            if kill_on_close || allow_breakaway {
                 let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                limits.BasicLimitInformation.LimitFlags = (if kill_on_close {
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                } else {
+                    0
+                }) | if allow_breakaway {
+                    JOB_OBJECT_LIMIT_BREAKAWAY_OK
+                } else {
+                    0
+                };
                 if SetInformationJobObject(
                     handle,
                     JobObjectExtendedLimitInformation,
@@ -221,11 +233,15 @@ impl Drop for ProcessJob {
 }
 
 #[cfg(not(windows))]
-struct ProcessJob;
+pub(crate) struct ProcessJob;
 
 #[cfg(not(windows))]
 impl ProcessJob {
-    fn assign(_child: &Child, _kill_on_close: bool) -> std::io::Result<Self> {
+    pub(crate) fn assign(
+        _child: &Child,
+        _kill_on_close: bool,
+        _allow_breakaway: bool,
+    ) -> std::io::Result<Self> {
         Ok(Self)
     }
 
@@ -519,6 +535,13 @@ where
     F: FnMut(bool, &[u8]) -> std::io::Result<()>,
 {
     let (mut command, _temporary_script) = prepare_command(req)?;
+    #[cfg(windows)]
+    if req.detached {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB;
+
+        command.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+    }
     if req.detached {
         command.stdout(Stdio::null()).stderr(Stdio::null());
     } else {
@@ -529,7 +552,7 @@ where
     }
 
     let mut child = command.spawn()?;
-    let job = match ProcessJob::assign(&child, !req.detached) {
+    let job = match ProcessJob::assign(&child, !req.detached, false) {
         Ok(job) => Some(job),
         Err(err) if require_job => {
             let message = format!(

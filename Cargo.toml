@@ -17,6 +17,7 @@ regex = { version = "1", default-features = false, features = ["std", "perf"] }
 toml = "0.9"
 
 [target.'cfg(windows)'.dependencies]
+notify = { version = "8.2", default-features = false }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Globalization",

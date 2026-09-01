@@ -15,11 +15,13 @@ function Invoke-JsonPost {
         [string]$Path,
         [hashtable]$Body
     )
+    $json = $Body | ConvertTo-Json -Compress
+    $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
     Invoke-RestMethod `
         -Method Post `
         -Uri "$($script:BaseUri)$Path" `
-        -ContentType "application/json" `
-        -Body ($Body | ConvertTo-Json -Compress)
+        -ContentType "application/json; charset=utf-8" `
+        -Body $jsonBytes
 }
 
 function Get-ResponseText {
@@ -73,7 +75,7 @@ function Get-FreeTcpPort {
     }
 }
 
-$binary = (Resolve-Path "target/release/lcr.exe").Path
+$sourceBinary = (Resolve-Path "target/release/lcr.exe").Path
 $listenHost = "127.0.0.1"
 $listenPort = Get-FreeTcpPort
 $listenAddress = "${listenHost}:$listenPort"
@@ -86,7 +88,7 @@ $cwdConfigServer = $null
 $configServer = $null
 $arrayConfigServer = $null
 $failed = $false
-$script:ExpectedCaseCount = 27
+$script:ExpectedCaseCount = 28
 $script:CaseCount = 0
 $script:PassedCaseCount = 0
 $script:CurrentCase = $null
@@ -96,6 +98,8 @@ $detachedChildName = $null
 $totalTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
 New-Item -ItemType Directory -Path $testRoot | Out-Null
+$binary = Join-Path $testRoot "lcr.exe"
+Copy-Item -LiteralPath $sourceBinary -Destination $binary
 
 try {
     Start-E2ECase "CLI help and command metadata"
@@ -666,7 +670,7 @@ command_allowlist = ['where.exe ']
     }
     Assert-True $cwdConfigResult.ok "current-directory config should be loaded"
     Assert-True `
-        ($cwdConfigResult.stdout.Contains($cwdConfigRoot)) `
+        ($cwdConfigResult.stdout.Contains("cwd-marker.txt")) `
         "current-directory config should set the default work_dir"
     Complete-E2ECase
 
@@ -796,6 +800,37 @@ command_allowlist = ['where.exe ', 'cmd.exe ']
     }
     catch { $outsideUploadStatus = [int]$_.Exception.Response.StatusCode }
     Assert-True ($outsideUploadStatus -eq 403) "uploads outside work_dir should be rejected"
+    Complete-E2ECase
+
+    Start-E2ECase "Configured server restarts after a config change"
+    @"
+work_dir = '$configRoot'
+command_allowlist = ['hostname.exe']
+"@ | Set-Content -LiteralPath $configFile -Encoding utf8
+    $configReloaded = $false
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+        try {
+            $hostnameResult = Invoke-RestMethod -Method Post -Uri "$configBaseUri/exec" `
+                -ContentType "application/json" `
+                -Body '{"program":"hostname.exe"}'
+            $whereStatus = 0
+            try {
+                Invoke-RestMethod -Method Post -Uri "$configBaseUri/exec" `
+                    -ContentType "application/json" `
+                    -Body '{"program":"where.exe","args":["hostname.exe"]}' | Out-Null
+            }
+            catch { $whereStatus = [int]$_.Exception.Response.StatusCode }
+            if ($hostnameResult.ok -and $whereStatus -eq 403) {
+                $configReloaded = $true
+                break
+            }
+        }
+        catch {
+            if ($configServer.HasExited) { throw "configured lcr exited during config restart" }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    Assert-True $configReloaded "valid config changes should restart with the new policy"
     Complete-E2ECase
 
     Start-E2ECase "Multiple configured work directories"
