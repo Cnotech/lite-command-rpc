@@ -225,7 +225,7 @@ LCR 会先以 `WimBuilder.cmd "build"` 检查白名单，再只在该请求的�
 
 CMD 临时脚本使用 `.cmd` 扩展名并切换至 UTF-8 代码页，PowerShell 临时脚本使用带 UTF-8 BOM 的 `.ps1` 文件，其他解释器使用通用脚本文件。临时文件会在执行结束、超时或启动失败后自动删除。
 
-`detached: true` 适用于由 CMD 或 PowerShell 包装脚本启动 GUI 程序的场景。为了避免 GUI 子进程继承输出管道并阻止包装脚本会话结束，detached 模式会将 stdout/stderr 重定向到空设备，因此响应中的两个输出字段为空。包装脚本仍会被加入 Job Object，所以在包装脚本运行期间，超时和 `/spawn/terminate` 仍会终止其进程树；包装脚本正常结束、会话进入 `exited` 后，已经启动的子进程不会因为 Job Object 关闭而被结束，也不再由该会话跟踪或终止。默认值 `false` 保持输出捕获和严格的进程树清理行为。
+`detached: true` 适用于由 CMD 或 PowerShell 包装脚本启动 GUI 程序的场景。为了避免 GUI 子进程继承输出管道并阻止包装脚本会话结束，detached 模式会将 stdout/stderr 重定向到空设备，因此响应中的两个输出字段为空。包装脚本仍会被加入 Job Object，所以在包装脚本运行期间，超时和 `/spawn/terminate` 仍会终止其进程树；包装脚本正常结束、会话进入 `exited` 后，已经启动的子进程不会因为 LCR 自己的 Job Object 关闭而被结束，也不再由该会话跟踪或终止。如果 LCR 本身位于外层 Job Object 中，则仅在外层明确允许 breakaway 时请求脱离；否则子进程继续继承外层 Job，因而仍可能在服务管理器或 CI runner 结束外层 Job 时被终止。默认值 `false` 保持输出捕获和严格的进程树清理行为。
 
 响应示例：
 

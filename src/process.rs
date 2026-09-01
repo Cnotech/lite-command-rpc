@@ -276,6 +276,55 @@ pub(crate) struct ProcessJob {
 }
 
 #[cfg(windows)]
+fn breakaway_flag_for_limits(limits: u32) -> u32 {
+    use windows_sys::Win32::System::{
+        JobObjects::{JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK},
+        Threading::CREATE_BREAKAWAY_FROM_JOB,
+    };
+
+    if limits & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK != 0 {
+        0
+    } else if limits & JOB_OBJECT_LIMIT_BREAKAWAY_OK != 0 {
+        CREATE_BREAKAWAY_FROM_JOB
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+fn detached_creation_flags() -> u32 {
+    use std::mem::zeroed;
+    use windows_sys::Win32::System::{
+        JobObjects::{
+            IsProcessInJob, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        },
+        Threading::GetCurrentProcess,
+    };
+
+    unsafe {
+        let mut in_job = 0;
+        if IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) == 0
+            || in_job == 0
+        {
+            return 0;
+        }
+        let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+        if QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            &mut information as *mut _ as _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return 0;
+        }
+        breakaway_flag_for_limits(information.BasicLimitInformation.LimitFlags)
+    }
+}
+
+#[cfg(windows)]
 impl ProcessJob {
     pub(crate) fn assign(
         child: &Child,
@@ -1048,9 +1097,8 @@ where
     #[cfg(windows)]
     if req.detached {
         use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB;
 
-        command.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+        command.creation_flags(detached_creation_flags());
     }
     if req.detached {
         command.stdout(Stdio::null()).stderr(Stdio::null());
@@ -1333,6 +1381,25 @@ mod tests {
     fn detached_is_opt_in() {
         assert!(!request(r#"{"command":"echo hello"}"#).detached);
         assert!(request(r#"{"command":"echo hello","detached":true}"#).detached);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detached_only_requests_breakaway_when_the_outer_job_allows_it() {
+        use windows_sys::Win32::System::{
+            JobObjects::{JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK},
+            Threading::CREATE_BREAKAWAY_FROM_JOB,
+        };
+
+        assert_eq!(breakaway_flag_for_limits(0), 0);
+        assert_eq!(
+            breakaway_flag_for_limits(JOB_OBJECT_LIMIT_BREAKAWAY_OK),
+            CREATE_BREAKAWAY_FROM_JOB
+        );
+        assert_eq!(
+            breakaway_flag_for_limits(JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK),
+            0
+        );
     }
 
     #[test]
