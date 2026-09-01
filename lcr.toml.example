@@ -8,6 +8,7 @@
 # 启用后会仅允许使用 cmd，并严格要求通过 program + args 的形式调用
 # command_allowlist = [
 #   "notepad.exe ",
+#   "WimBuilder.cmd", # work_dir 中同名的 .cmd/.bat 可直接按文件名运行
 #   '/^git(\.exe)? "status"$/',
 #   '/^cargo(\.exe)? "(check|test)"/',
 # ]

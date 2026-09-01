@@ -213,6 +213,7 @@ impl RuntimePolicy {
         }
         request.cwd = Some(cwd.path.to_string_lossy().into_owned());
         request.cwd_guard = Some(cwd._guard);
+        self.resolve_allowlisted_batch_program(request)?;
         Ok(())
     }
 
@@ -291,6 +292,47 @@ impl RuntimePolicy {
         })?;
         self.ensure_within_root(&resolved)?;
         self.guard_existing(resolved)
+    }
+
+    fn resolve_allowlisted_batch_program(&self, request: &mut ExecRequest) -> Result<(), String> {
+        if self.command_allowlist.is_empty() || self.work_dirs.is_empty() {
+            return Ok(());
+        }
+        let Some(program) = request.program.as_deref() else {
+            return Ok(());
+        };
+        let path = Path::new(program);
+        let mut components = path.components();
+        let Some(Component::Normal(_)) = components.next() else {
+            return Ok(());
+        };
+        if components.next().is_some()
+            || !path.extension().is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+            })
+        {
+            return Ok(());
+        }
+
+        let cwd = request
+            .cwd
+            .as_deref()
+            .expect("configured work_dir always resolves cwd");
+        let resolved = fs::canonicalize(Path::new(cwd).join(path)).map_err(|err| {
+            format!(
+                "allowlisted batch program does not exist in cwd: {}: {err}",
+                path.display()
+            )
+        })?;
+        self.ensure_within_root(&resolved)?;
+        if !resolved.is_file() {
+            return Err(format!(
+                "allowlisted batch program is not a file in cwd: {}",
+                path.display()
+            ));
+        }
+        request.program = Some(resolved.to_string_lossy().into_owned());
+        Ok(())
     }
 
     fn guard_existing(&self, path: PathBuf) -> Result<GuardedPath, String> {
@@ -765,6 +807,47 @@ mod tests {
         let error = policy.prepare_exec(&mut blocked).unwrap_err();
         assert!(error.contains("program invocation is not allowed by command_allowlist"));
         assert!(error.contains(r#"/^git\.exe "status"$/"#));
+    }
+
+    #[test]
+    fn allowlisted_batch_filename_is_resolved_from_the_work_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "lcr-config-batch-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let batch = root.join("WimBuilder.cmd");
+        fs::write(&batch, "@echo off\r\n").unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let policy = RuntimePolicy {
+            work_dirs: vec![root.clone()],
+            default_work_dir: Some(root.clone()),
+            command_allowlist: vec![parse_command_rule("WimBuilder.cmd".to_string()).unwrap()],
+        };
+        let mut request = serde_json::from_value::<ExecRequest>(serde_json::json!({
+            "program": "WimBuilder.cmd",
+            "args": ["build"]
+        }))
+        .unwrap();
+
+        policy.prepare_exec(&mut request).unwrap();
+        assert_eq!(
+            request.program,
+            Some(
+                fs::canonicalize(&batch)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert_eq!(request.cwd, Some(root.to_string_lossy().into_owned()));
+
+        drop(request);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

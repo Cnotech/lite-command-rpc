@@ -75,7 +75,7 @@ work_dir = ["D:\\WorkspaceA", "D:\\WorkspaceB"]
 
 设置非空 `command_allowlist` 后，`command`（或直接执行请求中的 `program`）必须至少匹配一条规则。普通字符串采用“以该字符串开头”的匹配方式；以 `/` 开头并以 `/` 结尾的值视为正则表达式。正则按 UTF-8 字节匹配，支持 ASCII 字符类和 ASCII 大小写匹配；`.*` 等表达式仍可覆盖 Unicode 参数，但不支持 Unicode 属性、Unicode 字符类或 Unicode 大小写折叠。使用不受支持的表达式会导致配置加载失败。空数组或省略该字段表示不限制命令。
 
-直接执行 `program` 时，匹配文本由程序名及所有参数组成，参数使用 JSON 字符串形式加引号。例如 `{"program":"git.exe","args":["status"]}` 的匹配文本是 `git.exe "status"`。白名单启用时不允许使用自定义绝对 `interpreter`，避免解释器本身绕过命令规则；仍可使用内置的 `cmd` 或 `pwsh`。
+直接执行 `program` 时，匹配文本由程序名及所有参数组成，参数使用 JSON 字符串形式加引号。例如 `{"program":"git.exe","args":["status"]}` 的匹配文本是 `git.exe "status"`。当同时启用了 `work_dir` 和白名单时，纯文件名形式的 `.cmd` 或 `.bat` 会在已验证的 `cwd` 中查找并以其绝对路径启动；因此可用 `"WimBuilder.cmd"` 这类规则放行工作目录中的同名批处理文件。带目录的相对路径、绝对路径和其他程序仍按请求原文匹配。白名单启用时不允许使用自定义绝对 `interpreter`，避免解释器本身绕过命令规则；仍可使用内置的 `cmd` 或 `pwsh`。
 
 命令因白名单或工作目录策略被拒绝时，`/exec`、`/exec/stream` 和 `/spawn` 均返回 HTTP `403 Forbidden`，响应 JSON 的 `msg` 字段包含具体原因。
 
@@ -169,6 +169,22 @@ curl -X POST http://127.0.0.1:9527/exec `
 ```
 
 `program` 与 `command`、`interpreter` 互斥。参数会直接通过 Windows 宽字符进程 API 传递。
+
+若同时设置了 `work_dir` 和非空 `command_allowlist`，可直接运行工作目录中的批处理文件，无需将目录加入 `PATH`：
+
+```toml
+work_dir = 'C:\\Projects\\WimBuilder'
+command_allowlist = ['WimBuilder.cmd']
+```
+
+```json
+{
+  "program": "WimBuilder.cmd",
+  "args": ["build"]
+}
+```
+
+LCR 会先以 `WimBuilder.cmd "build"` 检查白名单，再只在该请求的已验证 `cwd` 中解析这个文件名。`.bat` 同样适用。
 
 #### 输出编码
 

@@ -683,9 +683,11 @@ command_allowlist = ['where.exe ']
     $configStderr = Join-Path $testRoot "config-server.stderr.log"
     New-Item -ItemType Directory -Path $configRoot | Out-Null
     Set-Content -LiteralPath (Join-Path $configRoot "marker.txt") -Value "marker"
+    @("@echo off", "echo allowlisted-batch-%~1") |
+        Set-Content -LiteralPath (Join-Path $configRoot "allowlisted.cmd") -Encoding ascii
     @"
 work_dir = '$configRoot'
-command_allowlist = ['where.exe ', 'cmd.exe ']
+command_allowlist = ['where.exe ', 'cmd.exe ', 'allowlisted.cmd']
 "@ | Set-Content -LiteralPath $configFile -Encoding utf8
     $configServer = Start-Process `
         -FilePath $binary `
@@ -715,6 +717,13 @@ command_allowlist = ['where.exe ', 'cmd.exe ']
         -ContentType "application/json" `
         -Body (@{ program = "WHERE.EXE"; args = @("/r", ".", "marker.txt") } | ConvertTo-Json -Compress)
     Assert-True ($configEcho.stdout.Contains("marker.txt")) "program prefix matching should ignore case"
+    $configBatch = Invoke-RestMethod -Method Post -Uri "$configBaseUri/exec" `
+        -ContentType "application/json" `
+        -Body (@{ program = "allowlisted.cmd"; args = @("ok") } | ConvertTo-Json -Compress)
+    Assert-True $configBatch.ok "allowlisted batch filename should run from work_dir"
+    Assert-True `
+        ($configBatch.stdout.Contains("allowlisted-batch-ok")) `
+        "allowlisted batch filename should be resolved from work_dir"
     foreach ($blockedEndpoint in @("/exec", "/exec/stream", "/spawn")) {
         $blockedStatus = 0
         $blockedMsg = $null
@@ -733,7 +742,7 @@ command_allowlist = ['where.exe ', 'cmd.exe ']
             (([string]$blockedMsg).Contains("program invocation is not allowed by command_allowlist")) `
             "$blockedEndpoint should explain program rejection in msg"
         Assert-True `
-            (([string]$blockedMsg).Contains('allowed program rules: [where.exe , cmd.exe ]')) `
+            (([string]$blockedMsg).Contains('allowed program rules: [where.exe , cmd.exe , allowlisted.cmd]')) `
             "$blockedEndpoint should list allowed program rules in msg"
     }
     foreach ($commandEndpoint in @("/exec", "/exec/stream", "/spawn")) {
