@@ -60,6 +60,8 @@ struct FileConfig {
     work_dir: Option<WorkDirConfig>,
     #[serde(default)]
     command_allowlist: Vec<String>,
+    #[serde(default)]
+    allow_elevation: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +82,7 @@ pub struct RuntimePolicy {
     work_dirs: Vec<PathBuf>,
     default_work_dir: Option<PathBuf>,
     command_allowlist: Vec<CommandRule>,
+    allow_elevation: bool,
 }
 
 impl RuntimePolicy {
@@ -154,10 +157,17 @@ impl RuntimePolicy {
             work_dirs,
             default_work_dir,
             command_allowlist,
+            allow_elevation: config.allow_elevation,
         })
     }
 
     pub fn prepare_exec(&self, request: &mut ExecRequest) -> Result<(), String> {
+        if request.require_admin && !self.allow_elevation {
+            return Err(
+                "administrator elevation is disabled; set allow_elevation = true in lcr.toml"
+                    .to_string(),
+            );
+        }
         if !self.command_allowlist.is_empty() {
             if request.command.is_some() {
                 return Err(format!(
@@ -191,7 +201,7 @@ impl RuntimePolicy {
             }
         }
         if self.work_dirs.is_empty() {
-            return Ok(());
+            return self.pin_elevated_allowlisted_program(request);
         }
         let cwd = match request.cwd.as_deref() {
             Some(cwd) => self.resolve_existing(Path::new(cwd))?,
@@ -214,7 +224,7 @@ impl RuntimePolicy {
         request.cwd = Some(cwd.path.to_string_lossy().into_owned());
         request.cwd_guard = Some(cwd._guard);
         self.resolve_allowlisted_batch_program(request)?;
-        Ok(())
+        self.pin_elevated_allowlisted_program(request)
     }
 
     pub fn resolve_download(&self, path: &Path) -> Result<GuardedDownload, String> {
@@ -325,13 +335,58 @@ impl RuntimePolicy {
             )
         })?;
         self.ensure_within_root(&resolved)?;
-        if !resolved.is_file() {
+        let guarded = self.guard_existing(resolved)?;
+        if !guarded.path.is_file() {
             return Err(format!(
                 "allowlisted batch program is not a file in cwd: {}",
                 path.display()
             ));
         }
-        request.program = Some(resolved.to_string_lossy().into_owned());
+        request.program = Some(guarded.path.to_string_lossy().into_owned());
+        request.program_guard = Some(guarded._guard);
+        Ok(())
+    }
+
+    fn pin_elevated_allowlisted_program(&self, request: &mut ExecRequest) -> Result<(), String> {
+        if !request.require_admin
+            || self.command_allowlist.is_empty()
+            || request.program_guard.is_some()
+        {
+            return Ok(());
+        }
+        let program = request
+            .program
+            .as_deref()
+            .expect("allowlisted requests require program");
+        let path = Path::new(program);
+        if !path.is_absolute() {
+            return Err(
+                "elevated allowlisted programs must resolve to an absolute path; configure work_dir for bare .cmd/.bat names or send an absolute program path"
+                    .to_string(),
+            );
+        }
+        let resolved = fs::canonicalize(path).map_err(|err| {
+            format!("elevated allowlisted program does not exist: {program}: {err}")
+        })?;
+        if !resolved.is_file() {
+            return Err(format!(
+                "elevated allowlisted program is not a file: {program}"
+            ));
+        }
+        let guard = PathGuard::lock(&resolved).map_err(|err| {
+            format!(
+                "failed to lock elevated program {}: {err}",
+                resolved.display()
+            )
+        })?;
+        let verified = fs::canonicalize(&resolved).map_err(|err| {
+            format!(
+                "elevated program changed during validation: {}: {err}",
+                resolved.display()
+            )
+        })?;
+        request.program = Some(verified.to_string_lossy().into_owned());
+        request.program_guard = Some(guard);
         Ok(())
     }
 
@@ -608,6 +663,7 @@ mod tests {
             work_dirs: vec![root.clone()],
             default_work_dir: Some(root.clone()),
             command_allowlist: Vec::new(),
+            allow_elevation: false,
         };
         assert_eq!(policy.resolve_existing(Path::new(".")).unwrap().path, root);
         let outside = root.parent().unwrap();
@@ -632,6 +688,7 @@ mod tests {
             work_dirs: vec![fs::canonicalize(&root).unwrap()],
             default_work_dir: Some(fs::canonicalize(&root).unwrap()),
             command_allowlist: Vec::new(),
+            allow_elevation: false,
         };
         assert_eq!(
             policy
@@ -731,6 +788,7 @@ mod tests {
             work_dirs: vec![root.clone(), other.clone()],
             default_work_dir: None,
             command_allowlist: Vec::new(),
+            allow_elevation: false,
         };
         let mut missing = serde_json::from_str::<ExecRequest>(r#"{"command":"echo hi"}"#).unwrap();
         let error = policy.prepare_exec(&mut missing).unwrap_err();
@@ -756,6 +814,30 @@ mod tests {
     #[test]
     fn repository_example_is_valid_toml() {
         let _: FileConfig = toml::from_str(include_str!("../lcr.toml.example")).unwrap();
+    }
+
+    #[test]
+    fn elevation_requires_an_explicit_config_opt_in() {
+        let mut blocked = serde_json::from_value::<ExecRequest>(serde_json::json!({
+            "command": "echo blocked",
+            "require_admin": true
+        }))
+        .unwrap();
+        let error = RuntimePolicy::default()
+            .prepare_exec(&mut blocked)
+            .unwrap_err();
+        assert!(error.contains("allow_elevation = true"));
+
+        let policy = RuntimePolicy {
+            allow_elevation: true,
+            ..RuntimePolicy::default()
+        };
+        let mut allowed = serde_json::from_value::<ExecRequest>(serde_json::json!({
+            "command": "echo allowed",
+            "require_admin": true
+        }))
+        .unwrap();
+        policy.prepare_exec(&mut allowed).unwrap();
     }
 
     #[cfg(windows)]
@@ -792,6 +874,7 @@ mod tests {
             command_allowlist: vec![
                 parse_command_rule(r#"/^git\.exe "status"$/"#.to_string()).unwrap(),
             ],
+            allow_elevation: false,
         };
         let mut allowed = serde_json::from_value::<ExecRequest>(serde_json::json!({
             "program": "git.exe",
@@ -827,10 +910,12 @@ mod tests {
             work_dirs: vec![root.clone()],
             default_work_dir: Some(root.clone()),
             command_allowlist: vec![parse_command_rule("WimBuilder.cmd".to_string()).unwrap()],
+            allow_elevation: true,
         };
         let mut request = serde_json::from_value::<ExecRequest>(serde_json::json!({
             "program": "WimBuilder.cmd",
-            "args": ["build"]
+            "args": ["build"],
+            "require_admin": true
         }))
         .unwrap();
 
@@ -851,11 +936,30 @@ mod tests {
     }
 
     #[test]
+    fn elevated_allowlist_rejects_an_unresolved_bare_executable() {
+        let policy = RuntimePolicy {
+            work_dirs: Vec::new(),
+            default_work_dir: None,
+            command_allowlist: vec![parse_command_rule("git.exe".to_string()).unwrap()],
+            allow_elevation: true,
+        };
+        let mut request = serde_json::from_value::<ExecRequest>(serde_json::json!({
+            "program": "git.exe",
+            "require_admin": true
+        }))
+        .unwrap();
+
+        let error = policy.prepare_exec(&mut request).unwrap_err();
+        assert!(error.contains("must resolve to an absolute path"));
+    }
+
+    #[test]
     fn allowlist_disables_command_requests() {
         let policy = RuntimePolicy {
             work_dirs: Vec::new(),
             default_work_dir: None,
             command_allowlist: vec![parse_command_rule("echo ".to_string()).unwrap()],
+            allow_elevation: false,
         };
         let mut request = serde_json::from_value::<ExecRequest>(serde_json::json!({
             "command": "echo allowed text"
@@ -872,6 +976,7 @@ mod tests {
             work_dirs: Vec::new(),
             default_work_dir: None,
             command_allowlist: vec![parse_command_rule("/".to_string()).unwrap()],
+            allow_elevation: false,
         };
         for program in [
             r"C:\Windows\System32\CMD.EXE",

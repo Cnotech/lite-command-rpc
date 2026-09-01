@@ -47,6 +47,7 @@ use std::{
 ///   interpreter   cmd, pwsh, or an absolute path; default: cmd
 ///   script_mode   auto, inline, or file; default: auto
 ///   detached      Let child processes survive after the wrapper exits; default: false
+///   require_admin Request UAC elevation through an LCR helper; default: false
 ///   output_encoding  utf8, oem, or ansi; default: utf8
 ///
 /// In auto mode, multiline commands are executed through temporary script files.
@@ -87,6 +88,17 @@ struct Cli {
 enum CliCommand {
     /// Start the HTTP service
     Serve,
+    #[command(hide = true)]
+    ElevatedExec {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        result: PathBuf,
+        #[arg(long)]
+        cancel: PathBuf,
+        #[arg(long)]
+        ready: PathBuf,
+    },
 }
 
 struct RequestHead {
@@ -267,6 +279,21 @@ fn main() -> ExitCode {
     }
     let cli = Cli::parse();
     logger::set_level(cli.log_level);
+    if let Some(CliCommand::ElevatedExec {
+        request,
+        result,
+        cancel,
+        ready,
+    }) = &cli.command
+    {
+        return match process::run_elevated_helper(request, result, cancel, ready) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                logger::error(format_args!("elevated helper failed: {err}"));
+                ExitCode::FAILURE
+            }
+        };
+    }
     let (policy, config_path) = match RuntimePolicy::load(cli.config.as_deref()) {
         Ok(value) => value,
         Err(err) => {
@@ -298,6 +325,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some(CliCommand::ElevatedExec { .. }) => unreachable!("elevated helper exits above"),
     }
 }
 

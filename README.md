@@ -56,6 +56,9 @@ command_allowlist = [
   "git status",
   "/^cargo (check|test)( |$)/",
 ]
+
+# 默认关闭。仅在可信网络中确实需要按请求触发 UAC 时启用。
+allow_elevation = true
 ```
 
 `work_dir` 也可以配置为目录数组：
@@ -138,6 +141,7 @@ curl -X POST http://127.0.0.1:9527/exec `
 | `interpreter` | 否 | 脚本解释器，默认为 `cmd`；可设为 `cmd`、`pwsh` 或解释器的 Windows 绝对路径 |
 | `script_mode` | 否 | 脚本执行方式，可设为 `auto`、`inline` 或 `file`，默认为 `auto` |
 | `detached` | 否 | 是否允许包装脚本正常退出后其子进程继续运行，默认为 `false` |
+| `require_admin` | 否 | 配置启用 `allow_elevation` 后，设为 `true` 会显示 UAC 并通过提升权限辅助进程执行；默认 `false` |
 | `output_encoding` | 否 | stdout/stderr 的编码，可设为 `utf8`、`oem` 或 `ansi`，默认为 `utf8` |
 
 解释器的调用方式如下：
@@ -185,6 +189,17 @@ command_allowlist = ['WimBuilder.cmd']
 ```
 
 LCR 会先以 `WimBuilder.cmd "build"` 检查白名单，再只在该请求的已验证 `cwd` 中解析这个文件名。`.bat` 同样适用。
+
+若脚本会自行请求 UAC 提权，建议由调用方显式要求管理员权限，避免未提升的 LCR 启动脚本后出现无报错的空操作：
+
+```json
+{
+  "program": "WimBuilder.cmd",
+  "require_admin": true
+}
+```
+
+服务端还必须显式配置 `allow_elevation = true`；默认值为 `false`，以避免未认证网络请求反复触发 UAC。LCR 未提升时会显示 Windows UAC 确认框；确认后由新的提升权限 LCR 进程执行，取消则在接口结果中返回 `administrator elevation was cancelled`。同一时间只允许一个待确认的 UAC 提示；用户确认前 `/spawn` 还没有可返回的会话。辅助进程确认目标已加入 Job Object 后才报告启动，超时和 `/spawn/terminate` 通过辅助进程终止提升后的进程树。提升执行的 stdout/stderr 各最多缓冲 8 MiB；`/exec/stream` 的输出会在提升权限辅助进程结束后回传。LCR 无法可靠判断任意批处理是否会在运行期间自行请求 UAC 提权，因此该字段需要由已知有此要求的调用方设置。
 
 #### 输出编码
 

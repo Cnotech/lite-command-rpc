@@ -88,7 +88,7 @@ $cwdConfigServer = $null
 $configServer = $null
 $arrayConfigServer = $null
 $failed = $false
-$script:ExpectedCaseCount = 28
+$script:ExpectedCaseCount = 29
 $script:CaseCount = 0
 $script:PassedCaseCount = 0
 $script:CurrentCase = $null
@@ -181,6 +181,19 @@ try {
         $invalidEncodingStatus = [int]$_.Exception.Response.StatusCode
     }
     Assert-True ($invalidEncodingStatus -eq 400) "unknown output encoding should be rejected"
+    Complete-E2ECase
+
+    Start-E2ECase "Administrator elevation is opt-in"
+    $adminResponse = Invoke-WebRequest `
+        -Method Post `
+        -Uri "$($script:BaseUri)/exec" `
+        -ContentType "application/json" `
+        -Body (@{ command = "echo admin-required-blocked"; require_admin = $true } | ConvertTo-Json -Compress) `
+        -SkipHttpErrorCheck
+    Assert-True ([int]$adminResponse.StatusCode -eq 403) "elevation should be disabled by default"
+    Assert-True `
+        ($adminResponse.Content.Contains("allow_elevation = true")) `
+        "elevation rejection should explain the server-side opt-in"
     Complete-E2ECase
 
     Start-E2ECase "Empty request without Content-Length"

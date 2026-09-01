@@ -4,6 +4,9 @@
 # work_dir = "."
 # work_dir = ['D:\WorkspaceA', 'D:\WorkspaceB']
 
+# 是否允许请求通过 require_admin = true 触发 UAC；默认关闭。
+# allow_elevation = false
+
 # 普通字符串按忽略大小写的调用前缀匹配；使用 /.../ 包裹的值按忽略大小写的正则表达式匹配。
 # 启用后会仅允许使用 cmd，并严格要求通过 program + args 的形式调用
 # command_allowlist = [
